@@ -1,0 +1,13 @@
+Camera List for Linux Devices
+/sys/class/video4linux/video0 ====> Microsoft® LifeCam HD-5000: Mi
+/sys/class/video4linux/video1 ====> Microsoft® LifeCam HD-5000: Mi
+/sys/class/video4linux/video10 ====> bcm2835-codec-decode
+/sys/class/video4linux/video11 ====> bcm2835-codec-encode
+/sys/class/video4linux/video12 ====> bcm2835-codec-isp
+/sys/class/video4linux/video13 ====> bcm2835-isp-output0
+/sys/class/video4linux/video14 ====> bcm2835-isp-capture0
+/sys/class/video4linux/video15 ====> bcm2835-isp-capture1
+/sys/class/video4linux/video16 ====> bcm2835-isp-stats2
+/sys/class/video4linux/video2 ====> Webcam C110: Webcam C110
+/sys/class/video4linux/video3 ====> Webcam C110: Webcam C110
+
