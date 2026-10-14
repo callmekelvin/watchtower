@@ -1,0 +1,16 @@
+[project]
+name = "watchtower"
+version = "0.1.0"
+description = "Cross-platform USB camera discovery backend"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "libusb-package>=1.0.30.0",
+    "pyusb>=1.3.1",
+    "pyside6>=6.12.0",
+    "opencv-python>=4.10.0",
+    "pydantic>=2.0.0",
+    "pyudev>=0.24.0; sys_platform == 'linux'",
+    "comtypes>=1.4.0; sys_platform == 'win32'",
+    "pyobjc-framework-avfoundation>=10.0; sys_platform == 'darwin'",
+]
