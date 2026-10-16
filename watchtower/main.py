@@ -1,14 +1,19 @@
-from backend.usb_discovery import UsbDiscovery
+import sys
 
-
-def discover_cameras():
-    # PyUSB - USB Devices Discovery
-    usb_devices = UsbDiscovery().list_video_devices()
-    print(usb_devices)
-
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtQml import QQmlApplicationEngine
 
 def main():
-    cameras = discover_cameras()
+    # Create Qt UI Application
+    app = QGuiApplication(sys.argv)
+    engine = QQmlApplicationEngine()
+    engine.addImportPath(sys.path[0])
+
+    engine.loadFromModule("ui", "home")
+    if not engine.rootObjects():
+        sys.exit(-1)
+
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
