@@ -21,7 +21,13 @@ ApplicationWindow {
 
             Button {
                 text: "Refresh Devices"
-                onClicked: bridge.refreshDevices()
+                onClicked: bridge && bridge.refreshDevices()
+            }
+
+            Label {
+                id: lastRefreshLabel
+                text: bridge && bridge.lastRefreshTime ? "Last refreshed: " + bridge.lastRefreshTime : ""
+                visible: text !== ""
             }
 
             Item { Layout.fillWidth: true }
@@ -43,6 +49,23 @@ ApplicationWindow {
                     cameraList.selectedDeviceId = deviceId;
                 }
             }
+        }
+
+        // Error / status area
+        Label {
+            id: errorLabel
+            Layout.fillWidth: true
+            text: ""
+            color: "red"
+            wrapMode: Text.Wrap
+            visible: text !== ""
+        }
+    }
+
+    Connections {
+        target: bridge
+        function onErrorOccurred(message) {
+            errorLabel.text = message;
         }
     }
 }
