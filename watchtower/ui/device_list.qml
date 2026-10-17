@@ -28,12 +28,11 @@ ColumnLayout {
             Repeater {
                 model: root.devices
 
-                Button {
+                CameraDeviceItem {
                     Layout.fillWidth: true
-                    text: modelData.description + (modelData.isDefault ? " (Default)" : "")
-                    checkable: true
-                    checked: root.selectedDeviceId === modelData.deviceId
-                    onClicked: root.deviceSelected(modelData.deviceId)
+                    device: modelData
+                    isSelected: root.selectedDeviceId === modelData.deviceId
+                    // onClicked intentionally disconnected for now
                 }
             }
         }

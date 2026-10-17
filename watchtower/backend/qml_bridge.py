@@ -10,6 +10,18 @@ def _device_to_dict(device) -> Dict[str, Any]:
         "deviceId": device.device_id,
         "description": device.description,
         "isDefault": device.is_default,
+        "photoResolutions": device.photo_resolutions,
+        "videoFormats": [
+            {
+                "resolution": vf.resolution,
+                "width": vf.width,
+                "height": vf.height,
+                "minFrameRate": vf.min_frame_rate,
+                "maxFrameRate": vf.max_frame_rate,
+                "pixelFormat": vf.pixel_format,
+            }
+            for vf in device.video_formats
+        ],
     }
 
 # QML Bridge - Exposes Backend State to QML
