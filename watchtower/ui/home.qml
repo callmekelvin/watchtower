@@ -3,32 +3,45 @@ import QtQuick.Controls
 import QtQuick.Layouts
 
 ApplicationWindow {
-    width: 300
-    height: 200
+    id: mainWindow
     visible: true
-    title: "Hello World"
-
-    readonly property list<string> texts: ["Hallo Welt", "Hei maailma",
-                                           "Hola Mundo", "Привет мир"]
-
-    function setText() {
-        var i = Math.round(Math.random() * 3)
-        text.text = texts[i]
-    }
+    width: 800
+    height: 600
+    title: "Watchtower"
 
     ColumnLayout {
-        anchors.fill:  parent
+        anchors.fill: parent
+        anchors.margins: 16
+        spacing: 12
 
-        Text {
-            id: text
-            text: "Hello World"
-            Layout.alignment: Qt.AlignHCenter
+        // Toolbar
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 12
+
+            Button {
+                text: "Refresh Devices"
+                onClicked: bridge.refreshDevices()
+            }
+
+            Item { Layout.fillWidth: true }
         }
-        Button {
-            text: "Click me"
-            Layout.alignment: Qt.AlignHCenter
-            onClicked: {
-                var test = bridge.get_video_inputs()
+
+        // Camera Device lists
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            spacing: 16
+
+            DeviceList {
+                id: cameraList
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                title: "Cameras"
+                devices: bridge ? bridge.videoInputs : []
+                onDeviceSelected: deviceId => {
+                    cameraList.selectedDeviceId = deviceId;
+                }
             }
         }
     }

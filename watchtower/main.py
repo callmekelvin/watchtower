@@ -4,16 +4,23 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 
 from backend.qml_bridge import QmlBridge
+from backend.device_manager import DeviceManager
 
 def main():
-    # Create Qt UI Application
+    # Create QT UI Application
     app = QGuiApplication(sys.argv)
     engine = QQmlApplicationEngine()
     engine.addImportPath(sys.path[0])
     print(sys.path[0])
 
+    
+    # Backend layer that observes hardware camera changes
+    device_manager = DeviceManager()  
+
+    # Adapter layer that exposes backend state to QML
+    bridge = QmlBridge(device_manager)  
+    
     # Connect Bridge (QT Backend) to QML UI
-    bridge = QmlBridge()
     engine.rootContext().setContextProperty("bridge", bridge)
 
     engine.loadFromModule("ui", "home")
