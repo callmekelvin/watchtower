@@ -28,8 +28,7 @@ ApplicationWindow {
             text: "Click me"
             Layout.alignment: Qt.AlignHCenter
             onClicked: {
-                var test = bridge.helloWorld("test")
-                console.log(test)
+                var test = bridge.get_video_inputs()
             }
         }
     }
