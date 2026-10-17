@@ -13,13 +13,15 @@ def main():
     engine.addImportPath(sys.path[0])
     print(sys.path[0])
 
-    
-    # Backend layer that observes hardware camera changes
-    device_manager = DeviceManager()  
+    # Backend layer that observes hardware camera changes on a worker thread
+    device_manager = DeviceManager()
 
     # Adapter layer that exposes backend state to QML
-    bridge = QmlBridge(device_manager)  
-    
+    bridge = QmlBridge(device_manager)
+
+    # Ensure the worker thread shuts down cleanly before the app exits
+    app.aboutToQuit.connect(device_manager.shutdown)
+
     # Connect Bridge (QT Backend) to QML UI
     engine.rootContext().setContextProperty("bridge", bridge)
 

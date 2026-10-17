@@ -18,6 +18,7 @@ ApplicationWindow {
         RowLayout {
             Layout.fillWidth: true
             spacing: 12
+            Layout.alignment: Qt.AlignRight
 
             Button {
                 text: "Refresh Devices"
@@ -29,8 +30,6 @@ ApplicationWindow {
                 text: bridge && bridge.lastRefreshTime ? "Last refreshed: " + bridge.lastRefreshTime : ""
                 visible: text !== ""
             }
-
-            Item { Layout.fillWidth: true }
         }
 
         // Camera Device lists
