@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 
-Window {
+ApplicationWindow {
     width: 300
     height: 200
     visible: true
@@ -27,7 +27,10 @@ Window {
         Button {
             text: "Click me"
             Layout.alignment: Qt.AlignHCenter
-            onClicked:  setText()
+            onClicked: {
+                var test = bridge.helloWorld("test")
+                console.log(test)
+            }
         }
     }
 }
