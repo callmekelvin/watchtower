@@ -5,6 +5,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 
 from backend.qml_bridge import QmlBridge
 from backend.device_manager import DeviceManager
+from backend.capture_session_manager import CaptureSessionManager
 
 def main():
     # Create QT UI Application
@@ -16,10 +17,14 @@ def main():
     # Backend layer that observes hardware camera changes on a worker thread
     device_manager = DeviceManager()
 
-    # Adapter layer that exposes backend state to QML
-    bridge = QmlBridge(device_manager)
+    # Manages live camera capture sessions on dedicated threads
+    capture_manager = CaptureSessionManager(device_manager)
 
-    # Ensure the worker thread shuts down cleanly before the app exits
+    # Adapter layer that exposes backend state to QML
+    bridge = QmlBridge(device_manager, capture_manager)
+
+    # Ensure background threads shut down cleanly before the app exits
+    app.aboutToQuit.connect(capture_manager.shutdown)
     app.aboutToQuit.connect(device_manager.shutdown)
 
     # Connect Bridge (QT Backend) to QML UI

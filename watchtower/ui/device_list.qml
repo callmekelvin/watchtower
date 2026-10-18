@@ -25,14 +25,17 @@ ColumnLayout {
             width: parent.width
             spacing: 4
 
+            // Create a Camera Device Item for each Device in the devices List
             Repeater {
                 model: root.devices
-
+                
                 CameraDeviceItem {
                     Layout.fillWidth: true
                     device: modelData
+
+                    // If Clicked -> Set this Camera as the Current Selected Device
                     isSelected: root.selectedDeviceId === modelData.deviceId
-                    // onClicked intentionally disconnected for now
+                    onClicked: root.deviceSelected(modelData.deviceId)
                 }
             }
         }

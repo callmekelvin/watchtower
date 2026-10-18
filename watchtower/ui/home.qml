@@ -5,8 +5,8 @@ import QtQuick.Layouts
 ApplicationWindow {
     id: mainWindow
     visible: true
-    width: 800
-    height: 600
+    width: 1024
+    height: 768
     title: "Watchtower"
 
     ColumnLayout {
@@ -32,7 +32,7 @@ ApplicationWindow {
             }
         }
 
-        // Camera Device lists
+        // Camera Device list and capture preview
         RowLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
@@ -42,10 +42,37 @@ ApplicationWindow {
                 id: cameraList
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+                Layout.preferredWidth: 350
                 title: "Cameras"
                 devices: bridge ? bridge.videoInputs : []
+                selectedDeviceId: bridge && bridge.captureManager ? bridge.captureManager.currentDeviceId : ""
                 onDeviceSelected: deviceId => {
-                    cameraList.selectedDeviceId = deviceId;
+                    // For the Selected Device ID
+                    if (bridge && bridge.captureManager) {
+                        bridge.captureManager.setCameraById(deviceId);
+                    }
+                }
+            }
+
+            CameraCapture {
+                id: cameraCapture
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                Layout.preferredWidth: 650
+                title: "Screen Capture"
+                device: {
+                    // Don't show any Cameras if none are selected
+                    if (!cameraList.selectedDeviceId || !bridge) {
+                        return null;
+                    }
+
+                    // Show the Selected Camera Device
+                    for (var i = 0; i < bridge.videoInputs.length; i++) {
+                        if (bridge.videoInputs[i].deviceId === cameraList.selectedDeviceId) {
+                            return bridge.videoInputs[i];
+                        }
+                    }
+                    return null;
                 }
             }
         }
@@ -63,6 +90,13 @@ ApplicationWindow {
 
     Connections {
         target: bridge
+        function onErrorOccurred(message) {
+            errorLabel.text = message;
+        }
+    }
+
+    Connections {
+        target: bridge ? bridge.captureManager : null
         function onErrorOccurred(message) {
             errorLabel.text = message;
         }

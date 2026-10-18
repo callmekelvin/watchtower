@@ -4,6 +4,7 @@ from typing import Any, Dict, List
 from PySide6.QtCore import QObject, Signal, Slot, Property
 
 from backend.device_manager import DeviceManager
+from backend.capture_session_manager import CaptureSessionManager
 
 def _device_to_dict(device) -> Dict[str, Any]:
     return {
@@ -35,9 +36,10 @@ class QmlBridge(QObject):
     # QML property notification signal for lastRefreshTime
     lastRefreshTimeChanged = Signal()
 
-    def __init__(self, device_manager: DeviceManager, parent: QObject | None = None):
+    def __init__(self, device_manager: DeviceManager, capture_manager: CaptureSessionManager, parent: QObject | None = None):
         super().__init__(parent)
         self._device_manager = device_manager
+        self._capture_manager = capture_manager
 
         # Notify QML of backend changes.
         self._device_manager.videoInputsChanged.connect(self.videoInputsChanged)
@@ -56,6 +58,11 @@ class QmlBridge(QObject):
         if timestamp is None:
             return "Not Refreshed"
         return timestamp.isoformat()
+
+    # Property - Access the Capture Session Manager from QML
+    @Property(QObject, constant=True)
+    def captureManager(self) -> CaptureSessionManager:
+        return self._capture_manager
 
     # Function - Trigger Device Retrieval Worker Thread
     @Slot()

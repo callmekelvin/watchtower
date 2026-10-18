@@ -50,6 +50,7 @@ Rectangle {
                 text: "Photo: " + (root.device.photoResolutions.length > 0 ? root.device.photoResolutions[0] : "N/A")
                 font.pointSize: 8
                 color: "gray"
+                wrapMode: Text.WordWrap
                 Layout.fillWidth: true
             }
         }
