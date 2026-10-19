@@ -3,3 +3,4 @@ home home.qml
 DeviceList device_list.qml
 CameraDeviceItem camera_device_item.qml
 CameraCapture camera_capture.qml
+RecordingPopup recording_popup.qml
