@@ -39,8 +39,14 @@ Rectangle {
                 visible: root.device !== null
 
                 Component.onCompleted: {
-                    if (bridge && bridge.captureManager && videoOutput.videoSink) {
-                        bridge.captureManager.setVideoSink(videoOutput.videoSink);
+                    if (bridge && bridge.captureManager && root.device && videoOutput.videoSink) {
+                        bridge.captureManager.setVideoSinkForDevice(root.device.deviceId, videoOutput.videoSink);
+                    }
+                }
+
+                Component.onDestruction: {
+                    if (bridge && bridge.captureManager && root.device) {
+                        bridge.captureManager.clearVideoSinkForDevice(root.device.deviceId);
                     }
                 }
             }

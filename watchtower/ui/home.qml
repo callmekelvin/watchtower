@@ -54,25 +54,31 @@ ApplicationWindow {
                 }
             }
 
-            CameraCapture {
-                id: cameraCapture
+            // Stack of Camera Capture Items - Only show selected Camera Device at one time
+            StackLayout {
+                id: captureStack
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 Layout.preferredWidth: 650
-                title: "Screen Capture"
-                device: {
-                    // Don't show any Cameras if none are selected
+                currentIndex: {
                     if (!cameraList.selectedDeviceId || !bridge) {
-                        return null;
+                        return -1;
                     }
-
-                    // Show the Selected Camera Device
                     for (var i = 0; i < bridge.videoInputs.length; i++) {
                         if (bridge.videoInputs[i].deviceId === cameraList.selectedDeviceId) {
-                            return bridge.videoInputs[i];
+                            return i;
                         }
                     }
-                    return null;
+                    return -1;
+                }
+
+                Repeater {
+                    model: bridge ? bridge.videoInputs : []
+
+                    CameraCapture {
+                        device: modelData
+                        title: "Screen Capture"
+                    }
                 }
             }
         }

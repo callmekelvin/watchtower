@@ -15,19 +15,23 @@ class CaptureSessionManager(QObject):
     sessionStarted = Signal(str)
     sessionStopped = Signal(str)
 
-    # Internal signal used to deliver the video sink to workers on their own threads.
-    _videoSinkRequested = Signal(QVideoSink)
+    # Internal signals used to deliver sink changes to workers on their own threads - Emit to all Camera Threads
+    _setWorkerVideoSink = Signal(str, QVideoSink)
+    _clearWorkerVideoSink = Signal(str)
 
     def __init__(self, device_manager: DeviceManager, parent: QObject | None = None):
         super().__init__(parent)
         self._device_manager = device_manager
 
-        # Store Capture Session Workers/ Threads - { Key: DeviceID, Value: SessionWorker/ Thread }
+        # Store Capture Session Workers/ Threads/ Sinks - { Key: DeviceID, Value: ... }
         self._workers: Dict[str, CaptureSessionWorker] = {}
         self._threads: Dict[str, QThread] = {}
+        self._sinks: Dict[str, QVideoSink] = {}
         self._current_device_id: str = ""
         self._camera_active: bool = False
-        self._video_sink: QVideoSink | None = None
+
+        # Start a capture worker for every camera that the device manager detects.
+        self._device_manager.videoInputsChanged.connect(self._on_video_inputs_changed)
 
     # Property - Listens and return Current Camera Device ID
     @Property(str, notify=currentDeviceIdChanged)
@@ -39,30 +43,37 @@ class CaptureSessionManager(QObject):
     def cameraActive(self) -> bool:
         return self._camera_active
 
-    @Slot(QVideoSink)
-    def setVideoSink(self, sink: QVideoSink) -> None:
-        # Store the sink so that future workers pick it up automatically.
-        self._video_sink = sink
-        self._videoSinkRequested.emit(sink)
+    # Function - Register the QVideoSink for a specific camera. The sink is created by QML's VideoOutput
+    @Slot(str, QVideoSink)
+    def setVideoSinkForDevice(self, device_id: str, sink: QVideoSink) -> None:
+        if not device_id or sink is None:
+            return
+        self._sinks[device_id] = sink
+        if device_id in self._workers:
+            self._setWorkerVideoSink.emit(device_id, sink)
 
-    # Temporary Function - For Current Scenario where we stop the Current Capture Session Worker Session/ Thread before starting a new one
+    # Function - Unregister the QVideoSink for a specific camera
+    @Slot(str)
+    def clearVideoSinkForDevice(self, device_id: str) -> None:
+        if not device_id:
+            return
+        self._sinks.pop(device_id, None)
+        if device_id in self._workers:
+            self._clearWorkerVideoSink.emit(device_id)
+
+    # Select which camera's feed is shown on the QML video output.
+    # The worker thread for the selected camera is not started or stopped here.
     @Slot(str)
     def setCameraById(self, device_id: str) -> None:
-        if not device_id:
-            self.stopCurrentSession()
-            return
-
         if device_id == self._current_device_id:
-            self._restart_current_session(device_id)
             return
+        self._set_current_device_id(device_id)
+        self._set_camera_active(bool(device_id))
 
-        self._stop_current_session()
-        self._start_session(device_id)
-
-    # Stop Current Capture Session Worker/ Thread
+    # Stop displaying the current camera - The underlying worker thread keeps running.
     @Slot()
     def stopCurrentSession(self) -> None:
-        self._stop_current_session()
+        self.setCameraById("")
 
     # Stop all Capture Session Workers/ Threads
     @Slot()
@@ -76,13 +87,17 @@ class CaptureSessionManager(QObject):
     def shutdown(self) -> None:
         self.stopAll()
 
+    # Start a worker for every newly detected camera.
+    def _on_video_inputs_changed(self) -> None:
+        for device in self._device_manager.video_inputs():
+            device_id = device.device_id
+            if device_id not in self._workers:
+                self._start_session(device_id)
+
     # Start Capture Session Worker/ Thread
     def _start_session(self, device_id: str) -> None:
         thread = QThread(self)
         worker = CaptureSessionWorker(device_id)
-
-        # Route sink changes to the worker thread.
-        self._videoSinkRequested.connect(worker.setVideoSink)
 
         # Move QT Worker Object into Thread
         worker.moveToThread(thread)
@@ -90,6 +105,10 @@ class CaptureSessionManager(QObject):
         # Track this Capture Worker/ Thread
         self._workers[device_id] = worker
         self._threads[device_id] = thread
+
+        # Connect sink-delivery signals before the thread starts so queued emissions work.
+        self._setWorkerVideoSink.connect(worker.setVideoSink)
+        self._clearWorkerVideoSink.connect(worker.clearVideoSink)
 
         # Wire cleanup signals to thread
         thread.finished.connect(worker.deleteLater)
@@ -104,24 +123,9 @@ class CaptureSessionManager(QObject):
         thread.started.connect(worker.initializeAndStart)
         thread.start()
 
-        # Prime the worker with the current sink after the thread has started.
-        if self._video_sink is not None:
-            self._videoSinkRequested.emit(self._video_sink)
-
-        self._set_current_device_id(device_id)
-        self._set_camera_active(True)
-
-    def _restart_current_session(self, device_id: str) -> None:
-        self._stop_session(device_id)
-        self._set_current_device_id("")
-        self._set_camera_active(False)
-        self._start_session(device_id)
-
-    def _stop_current_session(self) -> None:
-        if self._current_device_id:
-            self._stop_session(self._current_device_id)
-        self._set_current_device_id("")
-        self._set_camera_active(False)
+        # If a sink was already registered for this device, send it to the worker now/ again
+        if device_id in self._sinks:
+            self._setWorkerVideoSink.emit(device_id, self._sinks[device_id])
 
     def _stop_session(self, device_id: str) -> None:
         # Retrieve/ remove capture session from Worker/ Thread Dictionaries
@@ -156,11 +160,8 @@ class CaptureSessionManager(QObject):
         self.sessionStarted.emit(device_id)
 
     def _on_worker_error(self, device_id: str, message: str) -> None:
+        # Workers stay alive until application shutdown
         self.errorOccurred.emit(message)
-        self._stop_session(device_id)
-        if self._current_device_id == device_id:
-            self._set_current_device_id("")
-            self._set_camera_active(False)
 
     def _on_worker_stopped(self, device_id: str) -> None:
         if self._current_device_id == device_id:

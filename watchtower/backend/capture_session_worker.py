@@ -25,13 +25,24 @@ class CaptureSessionWorker(QObject):
         self._media_devices: QMediaDevices | None = None
         self._video_sink: QVideoSink | None = None
 
-    # Function - Called from Capture Session Manager Main Thread to 
-    @Slot(QVideoSink)
-    def setVideoSink(self, sink: QVideoSink) -> None:
+    # Function - Called from Capture Session Manager Main Thread to
+    @Slot(str, QVideoSink)
+    def setVideoSink(self, device_id: str, sink: QVideoSink) -> None:
         # Invoked from the main thread; queued to the worker thread.
+        if device_id != self._device_id:
+            return
         self._video_sink = sink
         if self._session is not None:
             self._session.setVideoSink(sink)
+
+    # Function - Detach this worker's session from its video sink.
+    @Slot(str)
+    def clearVideoSink(self, device_id: str) -> None:
+        if device_id != self._device_id:
+            return
+        self._video_sink = None
+        if self._session is not None:
+            self._session.setVideoSink(None)
 
     @Slot()
     def initializeAndStart(self) -> None:
