@@ -15,9 +15,16 @@ class CaptureSessionManager(QObject):
     sessionStarted = Signal(str)
     sessionStopped = Signal(str)
 
+    # Emitted when a worker's recording state changes (Arg: device_id, is_recording)
+    deviceRecordingStateChanged = Signal(str, bool)
+
     # Internal signals used to deliver sink changes to workers on their own threads - Emit to all Camera Threads
     _setWorkerVideoSink = Signal(str, QVideoSink)
     _clearWorkerVideoSink = Signal(str)
+
+    # Internal signals used to deliver recording commands to workers on their own threads.
+    _startRecordingForWorker = Signal(str, str)
+    _stopRecordingForWorker = Signal(str)
 
     def __init__(self, device_manager: DeviceManager, parent: QObject | None = None):
         super().__init__(parent)
@@ -27,6 +34,7 @@ class CaptureSessionManager(QObject):
         self._workers: Dict[str, CaptureSessionWorker] = {}
         self._threads: Dict[str, QThread] = {}
         self._sinks: Dict[str, QVideoSink] = {}
+        self._recording_states: Dict[str, bool] = {}
         self._current_device_id: str = ""
         self._camera_active: bool = False
 
@@ -83,6 +91,27 @@ class CaptureSessionManager(QObject):
         self._set_current_device_id("")
         self._set_camera_active(False)
 
+    # Start recording the specified device to the given folder.
+    @Slot(str, str)
+    def startRecordingForDevice(self, device_id: str, folder_path: str) -> None:
+        if not device_id:
+            return
+        if device_id in self._workers:
+            self._startRecordingForWorker.emit(device_id, folder_path)
+
+    # Stop recording the specified device.
+    @Slot(str)
+    def stopRecordingForDevice(self, device_id: str) -> None:
+        if not device_id:
+            return
+        if device_id in self._workers:
+            self._stopRecordingForWorker.emit(device_id)
+
+    # Query whether a given device is currently recording.
+    @Slot(str, result=bool)
+    def isDeviceRecording(self, device_id: str) -> bool:
+        return self._recording_states.get(device_id, False)
+
     # Terminate all ongoing Capture Session/ Thread on Program Exit
     def shutdown(self) -> None:
         self.stopAll()
@@ -109,6 +138,11 @@ class CaptureSessionManager(QObject):
         # Connect sink-delivery signals before the thread starts so queued emissions work.
         self._setWorkerVideoSink.connect(worker.setVideoSink)
         self._clearWorkerVideoSink.connect(worker.clearVideoSink)
+
+        # Wire recording command signals to the worker.
+        self._startRecordingForWorker.connect(worker.startRecording)
+        self._stopRecordingForWorker.connect(worker.stopRecording)
+        worker.recordingStateChanged.connect(self._on_worker_recording_state_changed)
 
         # Wire cleanup signals to thread
         thread.finished.connect(worker.deleteLater)
@@ -157,6 +191,7 @@ class CaptureSessionManager(QObject):
     # Worker Signal Functions
     def _on_session_ready(self, device_id: str, _session: QObject) -> None:
         # The session object is owned by the worker thread; QML uses the video sink.
+        self._recording_states[device_id] = False
         self.sessionStarted.emit(device_id)
 
     def _on_worker_error(self, device_id: str, message: str) -> None:
@@ -167,7 +202,12 @@ class CaptureSessionManager(QObject):
         if self._current_device_id == device_id:
             self._set_current_device_id("")
             self._set_camera_active(False)
+        self._recording_states.pop(device_id, None)
         self.sessionStopped.emit(device_id)
+
+    def _on_worker_recording_state_changed(self, device_id: str, is_recording: bool) -> None:
+        self._recording_states[device_id] = is_recording
+        self.deviceRecordingStateChanged.emit(device_id, is_recording)
 
     def _set_current_device_id(self, device_id: str) -> None:
         if self._current_device_id == device_id:

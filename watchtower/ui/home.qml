@@ -32,12 +32,13 @@ ApplicationWindow {
             }
         }
 
-        // Camera Device list and capture preview
+        // Camera Device list and Capture Preview
         RowLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
             spacing: 16
 
+            // Camera Device List
             DeviceList {
                 id: cameraList
                 Layout.fillWidth: true
