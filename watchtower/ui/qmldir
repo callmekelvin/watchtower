@@ -4,3 +4,4 @@ DeviceList device_list.qml
 CameraDeviceItem camera_device_item.qml
 CameraCapture camera_capture.qml
 RecordingPopup recording_popup.qml
+StorageSettingsPopup storage_settings_popup.qml

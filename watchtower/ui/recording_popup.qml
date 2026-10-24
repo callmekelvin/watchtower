@@ -21,10 +21,10 @@ Popup {
     anchors.centerIn: parent
     width: 420
     height: 240
+    padding: 20
 
     ColumnLayout {
         anchors.fill: parent
-        anchors.margins: 16
         spacing: 12
 
         Label {
@@ -67,8 +67,12 @@ Popup {
 
         RowLayout {
             Layout.fillWidth: true
+            Layout.bottomMargin: 12
             spacing: 8
-            Layout.alignment: Qt.AlignRight
+
+            Item {
+                Layout.fillWidth: true
+            }
 
             Button {
                 text: "Cancel"

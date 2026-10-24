@@ -25,6 +25,11 @@ ApplicationWindow {
                 onClicked: bridge && bridge.refreshDevices()
             }
 
+            Button {
+                text: "Storage Settings"
+                onClicked: storageSettingsPopup.open()
+            }
+
             Label {
                 id: lastRefreshLabel
                 text: bridge && bridge.lastRefreshTime ? "Last refreshed: " + bridge.lastRefreshTime : ""
@@ -95,10 +100,18 @@ ApplicationWindow {
         }
     }
 
+    // Open Storage Setting Dialog
+    StorageSettingsPopup {
+        id: storageSettingsPopup
+    }
+
     Connections {
         target: bridge
         function onErrorOccurred(message) {
             errorLabel.text = message;
+        }
+        function onStorageCritical(message) {
+            errorLabel.text = "STORAGE CRITICAL: " + message;
         }
     }
 
