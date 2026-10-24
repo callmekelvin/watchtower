@@ -2,7 +2,7 @@ import os
 import re
 from datetime import datetime, timezone
 
-from PySide6.QtCore import QObject, Signal, Slot, QUrl, QTimer
+from PySide6.QtCore import QObject, Signal, Slot, QUrl, QTimer, QDateTime
 from PySide6.QtMultimedia import QCamera, QCameraDevice, QMediaCaptureSession, QMediaDevices, QMediaFormat, QMediaMetaData, QMediaRecorder, QVideoSink
 
 from backend.device_worker import _decode_id
@@ -210,7 +210,10 @@ class CaptureSessionWorker(QObject):
         output_path = self._generate_output_path(self._output_folder)
         self._active_output_path = output_path
         self._recorder.setOutputLocation(QUrl.fromLocalFile(output_path))
-        self._recorder.setMetaData(QMediaMetaData.Key.Author, "watchtower_capture")
+        metadata = QMediaMetaData()
+        metadata.insert(QMediaMetaData.Key.Author, ["watchtower_capture"])
+        metadata.insert(QMediaMetaData.Key.Date, QDateTime.currentDateTimeUtc())
+        self._recorder.setMetaData(metadata)
         self.segmentStarted.emit(self._device_id, output_path)
         self._recorder.record()
         return True
