@@ -1,6 +1,6 @@
 from typing import Dict
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot, Property, QMetaObject, Qt
+from PySide6.QtCore import QObject, QThread, Signal, Slot, Property, QMetaObject, Qt, QUrl
 from PySide6.QtMultimedia import QVideoSink
 
 from backend.device_manager import DeviceManager
@@ -17,6 +17,9 @@ class CaptureSessionManager(QObject):
 
     # Emitted when a worker's recording state changes (Arg: device_id, is_recording)
     deviceRecordingStateChanged = Signal(str, bool)
+
+    # Emitted when a segment file has been finalized (Arg: device_id, finalized_file_path)
+    segmentFinalized = Signal(str, str)
 
     # Internal signals used to deliver sink changes to workers on their own threads - Emit to all Camera Threads
     _setWorkerVideoSink = Signal(str, QVideoSink)
@@ -37,6 +40,10 @@ class CaptureSessionManager(QObject):
         self._recording_states: Dict[str, bool] = {}
         self._current_device_id: str = ""
         self._camera_active: bool = False
+
+        # Active output folders and currently-writing segment files per device.
+        self._recording_folders: Dict[str, str] = {}
+        self._active_files: Dict[str, str] = {}
 
         # Start a capture worker for every camera that the device manager detects.
         self._device_manager.videoInputsChanged.connect(self._on_video_inputs_changed)
@@ -97,6 +104,11 @@ class CaptureSessionManager(QObject):
         if not device_id:
             return
         if device_id in self._workers:
+            # Normalize the folder path once on the manager thread so the
+            # tracked active folder matches the path the worker will use.
+            url = QUrl(folder_path)
+            local_path = url.toLocalFile() if url.isLocalFile() else folder_path
+            self._recording_folders[device_id] = local_path
             self._startRecordingForWorker.emit(device_id, folder_path)
 
     # Stop recording the specified device.
@@ -143,6 +155,8 @@ class CaptureSessionManager(QObject):
         self._startRecordingForWorker.connect(worker.startRecording)
         self._stopRecordingForWorker.connect(worker.stopRecording)
         worker.recordingStateChanged.connect(self._on_worker_recording_state_changed)
+        worker.segmentStarted.connect(self._on_segment_started, Qt.QueuedConnection)
+        worker.segmentFinalized.connect(self._on_segment_finalized, Qt.QueuedConnection)
 
         # Wire cleanup signals to thread
         thread.finished.connect(worker.deleteLater)
@@ -169,6 +183,9 @@ class CaptureSessionManager(QObject):
         if worker is None or thread is None:
             return
 
+        self._recording_folders.pop(device_id, None)
+        self._active_files.pop(device_id, None)
+
         try:
             # Safetly Stop Worker Thread - Invoke Stop Method within Capture Session Worker
             QMetaObject.invokeMethod(worker, "stop", Qt.QueuedConnection)
@@ -187,6 +204,8 @@ class CaptureSessionManager(QObject):
     def _cleanup_thread(self, device_id: str) -> None:
         self._workers.pop(device_id, None)
         self._threads.pop(device_id, None)
+        self._recording_folders.pop(device_id, None)
+        self._active_files.pop(device_id, None)
 
     # Worker Signal Functions
     def _on_session_ready(self, device_id: str, _session: QObject) -> None:
@@ -203,11 +222,22 @@ class CaptureSessionManager(QObject):
             self._set_current_device_id("")
             self._set_camera_active(False)
         self._recording_states.pop(device_id, None)
+        self._recording_folders.pop(device_id, None)
+        self._active_files.pop(device_id, None)
         self.sessionStopped.emit(device_id)
 
     def _on_worker_recording_state_changed(self, device_id: str, is_recording: bool) -> None:
         self._recording_states[device_id] = is_recording
+        if not is_recording:
+            self._recording_folders.pop(device_id, None)
+            self._active_files.pop(device_id, None)
         self.deviceRecordingStateChanged.emit(device_id, is_recording)
+
+    def _on_segment_started(self, device_id: str, file_path: str) -> None:
+        self._active_files[device_id] = file_path
+
+    def _on_segment_finalized(self, device_id: str, file_path: str) -> None:
+        self.segmentFinalized.emit(device_id, file_path)
 
     def _set_current_device_id(self, device_id: str) -> None:
         if self._current_device_id == device_id:

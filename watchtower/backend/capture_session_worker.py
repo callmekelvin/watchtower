@@ -2,7 +2,7 @@ import os
 import re
 from datetime import datetime, timezone
 
-from PySide6.QtCore import QObject, Signal, Slot, QUrl
+from PySide6.QtCore import QObject, Signal, Slot, QUrl, QTimer
 from PySide6.QtMultimedia import QCamera, QCameraDevice, QMediaCaptureSession, QMediaDevices, QMediaFormat, QMediaRecorder, QVideoSink
 
 from backend.device_worker import _decode_id
@@ -31,6 +31,15 @@ class CaptureSessionWorker(QObject):
     # Emitted when the recording state changes (Arg: device_id, is_recording)
     recordingStateChanged = Signal(str, bool)
 
+    # Emitted when a new segment file begins being written (Arg: device_id, file_path)
+    segmentStarted = Signal(str, str)
+
+    # Emitted when a segment file has been finalized (Arg: device_id, finalized_file_path)
+    segmentFinalized = Signal(str, str)
+
+    # Hardcoded segment duration: 15 minutes in milliseconds.
+    _SEGMENT_DURATION_MS = 15 * 60 * 1000
+
     def __init__(self, device_id: str, parent: QObject | None = None):
         super().__init__(parent)
         self._device_id = device_id
@@ -41,6 +50,14 @@ class CaptureSessionWorker(QObject):
         self._video_sink: QVideoSink | None = None
         self._camera_device: QCameraDevice | None = None
         self._is_recording: bool = False
+
+        self._segment_timer: QTimer = QTimer(self)
+        self._segment_timer.setSingleShot(True)
+        self._segment_timer.timeout.connect(self._on_segment_timer_timeout)
+
+        self._output_folder: str | None = None
+        self._active_output_path: str | None = None
+        self._stop_requested: bool = False
 
     # Function - Called from Capture Session Manager Main Thread to
     @Slot(str, QVideoSink)
@@ -141,8 +158,17 @@ class CaptureSessionWorker(QObject):
         self._recorder.errorOccurred.connect(self._on_recorder_error)
 
     def _on_recorder_state_changed(self, state: QMediaRecorder.RecorderState) -> None:
-        is_recording = state == QMediaRecorder.RecorderState.RecordingState
-        self._set_recording(is_recording)
+        if state == QMediaRecorder.RecorderState.RecordingState:
+            self._set_recording(True)
+        elif state == QMediaRecorder.RecorderState.StoppedState:
+            if self._stop_requested:
+                old_path = self._active_output_path
+                self._active_output_path = None
+                if old_path:
+                    self.segmentFinalized.emit(self._device_id, old_path)
+                self._set_recording(False)
+            else:
+                self._start_next_segment()
 
     def _on_recorder_error(self, error: QMediaRecorder.Error, error_string: str) -> None:
         self.errorOccurred.emit(
@@ -158,9 +184,52 @@ class CaptureSessionWorker(QObject):
 
     def _generate_output_path(self, folder_path: str) -> str:
         name = _sanitize_filename(self._camera_device.description()) if self._camera_device else "camera"
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        filename = f"{name}_{timestamp}.mp4"
+        now = datetime.now(timezone.utc)
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
+        ms = now.strftime("%f")[:3]
+        filename = f"{name}_{timestamp}_{ms}.mp4"
         return os.path.join(folder_path, filename)
+
+    def _ensure_output_folder(self, folder_path: str) -> bool:
+        if os.path.isdir(folder_path):
+            return True
+        try:
+            os.makedirs(folder_path, exist_ok=True)
+            return True
+        except Exception as exc:
+            self.errorOccurred.emit(
+                self._device_id, f"Failed to create output folder '{folder_path}': {exc}"
+            )
+            return False
+
+    def _start_segment(self) -> bool:
+        if self._recorder is None or self._output_folder is None:
+            return False
+        if not self._ensure_output_folder(self._output_folder):
+            return False
+        output_path = self._generate_output_path(self._output_folder)
+        self._active_output_path = output_path
+        self._recorder.setOutputLocation(QUrl.fromLocalFile(output_path))
+        self.segmentStarted.emit(self._device_id, output_path)
+        self._recorder.record()
+        return True
+
+    def _start_next_segment(self) -> None:
+        old_path = self._active_output_path
+        if not self._start_segment():
+            self.errorOccurred.emit(
+                self._device_id, "Failed to rotate to next segment; recording stopped"
+            )
+            self._set_recording(False)
+            return
+        if old_path:
+            self.segmentFinalized.emit(self._device_id, old_path)
+        self._segment_timer.start(self._SEGMENT_DURATION_MS)
+
+    def _on_segment_timer_timeout(self) -> None:
+        if self._recorder is None or self._stop_requested or not self._is_recording:
+            return
+        self._recorder.stop()
 
     # Start recording video to the provided folder.
     @Slot(str, str)
@@ -179,15 +248,20 @@ class CaptureSessionWorker(QObject):
             url = QUrl(folder_path)
             local_path = url.toLocalFile() if url.isLocalFile() else folder_path
 
-            if not local_path or not os.path.isdir(local_path):
+            if not local_path:
                 self.errorOccurred.emit(
                     self._device_id, f"Invalid output folder: {folder_path}"
                 )
                 return
 
-            output_path = self._generate_output_path(local_path)
-            self._recorder.setOutputLocation(QUrl.fromLocalFile(output_path))
-            self._recorder.record()
+            self._stop_requested = False
+            self._output_folder = local_path
+
+            if not self._start_segment():
+                self._set_recording(False)
+                return
+
+            self._segment_timer.start(self._SEGMENT_DURATION_MS)
         except Exception as exc:
             self.errorOccurred.emit(self._device_id, f"Failed to start recording: {exc}")
             self._set_recording(False)
@@ -197,6 +271,8 @@ class CaptureSessionWorker(QObject):
     def stopRecording(self, device_id: str) -> None:
         if device_id != self._device_id:
             return
+        self._stop_requested = True
+        self._segment_timer.stop()
         try:
             if self._recorder is not None and self._is_recording:
                 self._recorder.stop()
@@ -208,6 +284,8 @@ class CaptureSessionWorker(QObject):
     def stop(self) -> None:
         # Stop Camera and Recorder
         # Then clear Camera and Recorder
+        self._stop_requested = True
+        self._segment_timer.stop()
         try:
             if self._recorder is not None and self._is_recording:
                 self._recorder.stop()
@@ -234,6 +312,8 @@ class CaptureSessionWorker(QObject):
             self._media_devices = None
             self._video_sink = None
             self._camera_device = None
+            self._output_folder = None
+            self._active_output_path = None
             self._set_recording(False)
         except Exception as exc:
             # Notify Capture Session Manager Thread of termination error
