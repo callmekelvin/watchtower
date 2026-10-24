@@ -1,10 +1,14 @@
-from typing import Dict
+from typing import Dict, Optional, Set
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot, Property, QMetaObject, Qt, QUrl
 from PySide6.QtMultimedia import QVideoSink
 
 from backend.device_manager import DeviceManager
 from backend.capture_session_worker import CaptureSessionWorker
+
+# Avoid a runtime import cycle - StorageManager is only used for type hints.
+StorageManager = "StorageManager"
+
 
 # CaptureSessionManager - Manages CaptureSessionWorker Threads, which perform multimedia processing
 class CaptureSessionManager(QObject):
@@ -21,17 +25,18 @@ class CaptureSessionManager(QObject):
     # Emitted when a segment file has been finalized (Arg: device_id, finalized_file_path)
     segmentFinalized = Signal(str, str)
 
-    # Internal signals used to deliver sink changes to workers on their own threads - Emit to all Camera Threads
+    # Internal signals used to deliver sink changes to workers on their own threads - Emit to all Camera Threads (Arg: device_id, Sink)
     _setWorkerVideoSink = Signal(str, QVideoSink)
     _clearWorkerVideoSink = Signal(str)
 
-    # Internal signals used to deliver recording commands to workers on their own threads.
+    # Internal signals used to deliver recording commands to workers on their own threads. (Arg: device_id, Folder Path)
     _startRecordingForWorker = Signal(str, str)
     _stopRecordingForWorker = Signal(str)
 
-    def __init__(self, device_manager: DeviceManager, parent: QObject | None = None):
+    def __init__(self, device_manager: DeviceManager, storage_manager: Optional[StorageManager] = None, parent: QObject | None = None):
         super().__init__(parent)
         self._device_manager = device_manager
+        self._storage_manager: Optional[StorageManager] = storage_manager
 
         # Store Capture Session Workers/ Threads/ Sinks - { Key: DeviceID, Value: ... }
         self._workers: Dict[str, CaptureSessionWorker] = {}
@@ -44,6 +49,13 @@ class CaptureSessionManager(QObject):
         # Active output folders and currently-writing segment files per device.
         self._recording_folders: Dict[str, str] = {}
         self._active_files: Dict[str, str] = {}
+
+        # Set when storage is critical so no new segments are started.
+        self._critical_stop_active: bool = False
+
+        # Connect storage manager signals.
+        if self._storage_manager is not None:
+            self._storage_manager.storageCritical.connect(self._on_storage_critical)
 
         # Start a capture worker for every camera that the device manager detects.
         self._device_manager.videoInputsChanged.connect(self._on_video_inputs_changed)
@@ -103,12 +115,32 @@ class CaptureSessionManager(QObject):
     def startRecordingForDevice(self, device_id: str, folder_path: str) -> None:
         if not device_id:
             return
+
+        # Normalize the folder path once on the manager thread so the
+        # tracked active folder matches the path the worker will use.
+        url = QUrl(folder_path)
+        local_path = url.toLocalFile() if url.isLocalFile() else folder_path
+        if not local_path:
+            self.errorOccurred.emit(f"Invalid output folder: {folder_path}")
+            return
+
+        # Check if there is sufficient space to begin recording
+        if self._storage_manager is not None:
+            free_gb = self._storage_manager.free_space_gb_for_path(local_path)
+            min_free_gb = self._storage_manager.minFreeSpaceGb
+            if free_gb < min_free_gb:
+                self.errorOccurred.emit(f"Insufficient free space ({free_gb:.2f} GB). Recording requires at least {min_free_gb} GB.")
+                return
+
+        # There is sufficient space/ space has been made available since last check
+        self._critical_stop_active = False
+
+        if self._storage_manager is not None:
+            self._storage_manager.addManagedFolder(local_path)
+
         if device_id in self._workers:
-            # Normalize the folder path once on the manager thread so the
-            # tracked active folder matches the path the worker will use.
-            url = QUrl(folder_path)
-            local_path = url.toLocalFile() if url.isLocalFile() else folder_path
             self._recording_folders[device_id] = local_path
+            self._update_storage_manager()
             self._startRecordingForWorker.emit(device_id, folder_path)
 
     # Stop recording the specified device.
@@ -127,6 +159,21 @@ class CaptureSessionManager(QObject):
     # Terminate all ongoing Capture Session/ Thread on Program Exit
     def shutdown(self) -> None:
         self.stopAll()
+
+    # React to a critical storage situation by stopping all recording
+    def _on_storage_critical(self, reason: str) -> None:
+        self._critical_stop_active = True
+        for device_id in list(self._recording_states.keys()):
+            if self._recording_states.get(device_id, False):
+                self.stopRecordingForDevice(device_id)
+
+    # Push the current active folders/files to the storage manager
+    def _update_storage_manager(self) -> None:
+        if self._storage_manager is None:
+            return
+        folders: Set[str] = set(self._recording_folders.values())
+        protected: Set[str] = set(self._active_files.values())
+        self._storage_manager.updateActiveFolders(list(folders), protected)
 
     # Start a worker for every newly detected camera.
     def _on_video_inputs_changed(self) -> None:
@@ -185,6 +232,7 @@ class CaptureSessionManager(QObject):
 
         self._recording_folders.pop(device_id, None)
         self._active_files.pop(device_id, None)
+        self._update_storage_manager()
 
         try:
             # Safetly Stop Worker Thread - Invoke Stop Method within Capture Session Worker
@@ -206,6 +254,7 @@ class CaptureSessionManager(QObject):
         self._threads.pop(device_id, None)
         self._recording_folders.pop(device_id, None)
         self._active_files.pop(device_id, None)
+        self._update_storage_manager()
 
     # Worker Signal Functions
     def _on_session_ready(self, device_id: str, _session: QObject) -> None:
@@ -224,6 +273,7 @@ class CaptureSessionManager(QObject):
         self._recording_states.pop(device_id, None)
         self._recording_folders.pop(device_id, None)
         self._active_files.pop(device_id, None)
+        self._update_storage_manager()
         self.sessionStopped.emit(device_id)
 
     def _on_worker_recording_state_changed(self, device_id: str, is_recording: bool) -> None:
@@ -231,13 +281,16 @@ class CaptureSessionManager(QObject):
         if not is_recording:
             self._recording_folders.pop(device_id, None)
             self._active_files.pop(device_id, None)
+        self._update_storage_manager()
         self.deviceRecordingStateChanged.emit(device_id, is_recording)
 
     def _on_segment_started(self, device_id: str, file_path: str) -> None:
         self._active_files[device_id] = file_path
+        self._update_storage_manager()
 
     def _on_segment_finalized(self, device_id: str, file_path: str) -> None:
         self.segmentFinalized.emit(device_id, file_path)
+        self._update_storage_manager()
 
     def _set_current_device_id(self, device_id: str) -> None:
         if self._current_device_id == device_id:
