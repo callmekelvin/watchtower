@@ -12,4 +12,16 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pyinstaller>=6.22.3",
+    "pytest>=8.0.0",
+    "pytest-qt>=4.0.0",
+    "pytest-cov>=5.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+qt_api = "pyside6"
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: tests that exercise Qt event loops or thread lifecycles",
 ]
