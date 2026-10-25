@@ -6,7 +6,10 @@ a = Analysis(
     ['main.py'],
     pathex=['.'],
     binaries=[],
-    datas=[('ui', 'ui')],
+    datas=[
+        ('ui', 'ui'),
+        ('images/watchtower.ico', 'images'),
+    ],
     hiddenimports=[
         'backend',
         'PySide6.QtQuick',
@@ -41,4 +44,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='images/watchtower.ico',
 )
