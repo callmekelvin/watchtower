@@ -35,6 +35,14 @@ def main():
     # Adapter layer that exposes backend state to QML
     bridge = QmlBridge(device_manager, capture_manager, storage_manager)
 
+    # A fatal recording error should terminate the application rather than
+    # repeatedly attempting to restart recording.
+    def _on_fatal_error(message: str) -> None:
+        print(f"FATAL: {message}", file=sys.stderr)
+        app.exit(1)
+
+    bridge.fatalErrorOccurred.connect(_on_fatal_error)
+
     # Ensure background threads shut down cleanly before the app exits
     app.aboutToQuit.connect(capture_manager.shutdown)
     app.aboutToQuit.connect(device_manager.shutdown)

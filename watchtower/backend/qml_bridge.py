@@ -44,6 +44,9 @@ class QmlBridge(QObject):
     storageStatusChanged = Signal()
     storageCritical = Signal(str)
 
+    # Emitted when a recording failure should terminate the application.
+    fatalErrorOccurred = Signal(str)
+
     def __init__(self, device_manager: DeviceManager, capture_manager: CaptureSessionManager, storage_manager: StorageManager, parent: QObject | None = None):
         super().__init__(parent)
         self._device_manager = device_manager
@@ -59,6 +62,9 @@ class QmlBridge(QObject):
         self._storage_manager.policyChanged.connect(self.storagePolicyChanged)
         self._storage_manager.storageStatusChanged.connect(self.storageStatusChanged)
         self._storage_manager.storageCritical.connect(self.storageCritical)
+
+        # Forward fatal recording errors from the capture manager.
+        self._capture_manager.fatalErrorOccurred.connect(self.fatalErrorOccurred)
 
     # Property - Retrieve/ Subscribe to Cached Device List
     @Property(list, notify=videoInputsChanged)

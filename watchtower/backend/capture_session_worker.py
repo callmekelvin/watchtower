@@ -25,6 +25,10 @@ class CaptureSessionWorker(QObject):
     # Signal emitted when the worker encounters an error (Arg: device_id, message)
     errorOccurred = Signal(str, str)
 
+    # Signal emitted when a recording failure should terminate the application.
+    # Args: device_id, message
+    fatalErrorOccurred = Signal(str, str)
+
     # Signal emitted after stop() has finished cleaning up (Arg: Device ID)
     stopped = Signal(str)
 
@@ -58,6 +62,7 @@ class CaptureSessionWorker(QObject):
         self._output_folder: str | None = None
         self._active_output_path: str | None = None
         self._stop_requested: bool = False
+        self._segment_start_failed: bool = False
 
     # Function - Called from Capture Session Manager Main Thread to
     @Slot(str, QVideoSink)
@@ -159,6 +164,7 @@ class CaptureSessionWorker(QObject):
 
     def _on_recorder_state_changed(self, state: QMediaRecorder.RecorderState) -> None:
         if state == QMediaRecorder.RecorderState.RecordingState:
+            self._segment_start_failed = False
             self._set_recording(True)
         elif state == QMediaRecorder.RecorderState.StoppedState:
             if self._stop_requested:
@@ -167,10 +173,18 @@ class CaptureSessionWorker(QObject):
                 if old_path:
                     self.segmentFinalized.emit(self._device_id, old_path)
                 self._set_recording(False)
+            elif self._segment_start_failed:
+                self._segment_start_failed = False
+                self._set_recording(False)
+                self.fatalErrorOccurred.emit(
+                    self._device_id,
+                    f"Fatal recording error on camera {self._device_id}; terminating application",
+                )
             else:
                 self._start_next_segment()
 
     def _on_recorder_error(self, error: QMediaRecorder.Error, error_string: str) -> None:
+        self._segment_start_failed = True
         self.errorOccurred.emit(
             self._device_id, f"Recording error: {error_string or str(error)}"
         )
@@ -225,6 +239,10 @@ class CaptureSessionWorker(QObject):
                 self._device_id, "Failed to rotate to next segment; recording stopped"
             )
             self._set_recording(False)
+            self.fatalErrorOccurred.emit(
+                self._device_id,
+                f"Fatal: failed to rotate to next segment for camera {self._device_id}; terminating application",
+            )
             return
         if old_path:
             self.segmentFinalized.emit(self._device_id, old_path)
@@ -263,12 +281,20 @@ class CaptureSessionWorker(QObject):
 
             if not self._start_segment():
                 self._set_recording(False)
+                self.fatalErrorOccurred.emit(
+                    self._device_id,
+                    f"Fatal: failed to start recording for camera {self._device_id}; terminating application",
+                )
                 return
 
             self._segment_timer.start(self._SEGMENT_DURATION_MS)
         except Exception as exc:
             self.errorOccurred.emit(self._device_id, f"Failed to start recording: {exc}")
             self._set_recording(False)
+            self.fatalErrorOccurred.emit(
+                self._device_id,
+                f"Fatal: exception starting recording for camera {self._device_id}: {exc}; terminating application",
+            )
 
     # Stop the current recording
     @Slot(str)
