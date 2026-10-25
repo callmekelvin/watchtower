@@ -1,4 +1,5 @@
 import sys
+import os
 
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
@@ -8,12 +9,19 @@ from backend.device_manager import DeviceManager
 from backend.capture_session_manager import CaptureSessionManager
 from backend.storage_manager import StorageManager
 
+
+def app_dir():
+    # PyInstaller onefile extracts files to sys._MEIPASS
+    if hasattr(sys, '_MEIPASS'):
+        return sys._MEIPASS
+    # Normal Python run
+    return os.path.dirname(os.path.abspath(__file__))
+
 def main():
     # Create QT UI Application
     app = QGuiApplication(sys.argv)
     engine = QQmlApplicationEngine()
-    engine.addImportPath(sys.path[0])
-    print(sys.path[0])
+    engine.addImportPath(app_dir())
 
     # Backend layer that observes hardware camera changes on a worker thread
     device_manager = DeviceManager()
@@ -37,6 +45,7 @@ def main():
 
     engine.loadFromModule("ui", "home")
     if not engine.rootObjects():
+        print("Failed to load QML module 'ui'")
         sys.exit(-1)
 
     sys.exit(app.exec())
