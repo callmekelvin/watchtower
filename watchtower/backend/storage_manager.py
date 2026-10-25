@@ -21,7 +21,7 @@ class StorageManager(QObject):
 
     # Cross-thread signals used to communicate with StoragePurgeWorker.
     _setCheckIntervalMinutes = Signal(int)
-    _dispatchPurge = Signal(list, set, list, bool, int, int, str)
+    _dispatchPurge = Signal(list, set, list, bool, "qint64", "qint64", str)
     _startPurgeTimer = Signal()
     _stopPurgeTimer = Signal()
 

@@ -90,13 +90,20 @@ def test_recorder_state_change_emits_recording_stopped(qtbot):
     assert worker._is_recording is False
 
 
-def test_recorder_error_emits_error_and_stops_recording(qtbot):
+def test_recorder_error_emits_error_stops_recording_and_triggers_fatal_signal(qtbot):
     worker = CaptureSessionWorker("cam-1")
     worker._recorder = MagicMock()
     worker._is_recording = True
 
-    with qtbot.waitSignals([worker.errorOccurred, worker.recordingStateChanged], timeout=1000):
+    with qtbot.waitSignals(
+        [worker.errorOccurred, worker.recordingStateChanged], timeout=1000
+    ):
         worker._on_recorder_error(QMediaRecorder.Error.ResourceError, "disk full")
+
+    assert worker._segment_start_failed is True
+
+    with qtbot.waitSignal(worker.fatalErrorOccurred, timeout=1000):
+        worker._on_recorder_state_changed(QMediaRecorder.RecorderState.StoppedState)
 
     assert worker._is_recording is False
 
@@ -111,3 +118,26 @@ def test_stop_emits_stopped_signal(qtbot):
         worker.stop()
 
     assert worker._is_recording is False
+
+
+def test_start_next_segment_failure_emits_fatal_error(qtbot):
+    worker = CaptureSessionWorker("cam-1")
+    worker._recorder = MagicMock()
+    worker._output_folder = "/nonexistent/path/that/cannot/be/created"
+
+    with qtbot.waitSignals(
+        [worker.errorOccurred, worker.fatalErrorOccurred], timeout=1000
+    ):
+        worker._start_next_segment()
+
+    assert worker._is_recording is False
+
+
+def test_start_recording_failure_emits_fatal_error(qtbot):
+    worker = CaptureSessionWorker("cam-1")
+    worker._recorder = MagicMock()
+
+    with qtbot.waitSignals(
+        [worker.errorOccurred, worker.fatalErrorOccurred], timeout=1000
+    ):
+        worker.startRecording("cam-1", "/nonexistent/path/that/cannot/be/created")

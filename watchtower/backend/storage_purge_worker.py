@@ -61,7 +61,7 @@ class StoragePurgeWorker(QObject):
     def stopTimer(self) -> None:
         self._timer.stop()
 
-    @Slot(list, set, list, bool, int, int, str)
+    @Slot(list, set, list, bool, "qint64", "qint64", str)
     def performPurge(
         self,
         active_folders: List[str],
