@@ -159,3 +159,36 @@ def test_perform_purge_emits_purged_files(qtbot, mock_storage_info, temp_folder)
         )
 
     assert not old_file.exists()
+
+
+def test_purge_aborts_when_free_space_unknown(mock_storage_info, temp_folder, qtbot):
+    """If QStorageInfo cannot determine free space, no files should be deleted."""
+    mock_storage_info(-1)
+
+    old_file = make_recording(temp_folder, "cam_20230101_120000_000.mp4")
+    worker = StoragePurgeWorker()
+
+    with qtbot.waitSignal(worker.purgeFailed, timeout=1000) as blocker:
+        deleted = worker._purge([str(temp_folder)], set(), 0, 86400, str(temp_folder))
+
+    assert deleted == []
+    assert old_file.exists()
+    assert "Cannot determine free space" in blocker.args[0]
+
+
+def test_purge_normalizes_protected_file_paths(mock_storage_info, temp_folder):
+    """Protected files with redundant separators must still be protected."""
+    mock_storage_info(0)  # Force space-based deletion.
+
+    old = make_recording(temp_folder, "cam_20230101_120000_000.mp4")
+    newer = make_recording(temp_folder, "cam_20230102_120000_000.mp4")
+
+    worker = StoragePurgeWorker()
+    # Pass the protected path with a redundant separator.
+    protected = {str(temp_folder) + "/" + "cam_20230101_120000_000.mp4"}
+    deleted = worker._purge(
+        [str(temp_folder)], protected, 10 * 1024 ** 3, 86400 * 365, str(temp_folder)
+    )
+
+    assert str(old) not in deleted
+    assert str(newer) in deleted

@@ -109,11 +109,15 @@ class StoragePurgeWorker(QObject):
         if not folders_to_scan:
             return []
 
+        # Normalize protected paths so they match the normalized scanned paths.
+        protected_files = {os.path.normpath(p) for p in protected_files}
+
         # Get Storage Information
         storage = QStorageInfo(root_path) if root_path else QStorageInfo()
         free_bytes = storage.bytesAvailable()
         if free_bytes < 0:
-            free_bytes = 0
+            self.purgeFailed.emit(f"Cannot determine free space for '{root_path}'; aborting purge")
+            return []
 
         now_ts = datetime.now(timezone.utc).timestamp()
         retention_cutoff_ts = now_ts - max_retention_seconds
