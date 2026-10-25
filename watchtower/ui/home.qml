@@ -25,6 +25,11 @@ ApplicationWindow {
                 onClicked: bridge && bridge.refreshDevices()
             }
 
+            Button {
+                text: "Storage Settings"
+                onClicked: storageSettingsPopup.open()
+            }
+
             Label {
                 id: lastRefreshLabel
                 text: bridge && bridge.lastRefreshTime ? "Last refreshed: " + bridge.lastRefreshTime : ""
@@ -32,12 +37,13 @@ ApplicationWindow {
             }
         }
 
-        // Camera Device list and capture preview
+        // Camera Device list and Capture Preview
         RowLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
             spacing: 16
 
+            // Camera Device List
             DeviceList {
                 id: cameraList
                 Layout.fillWidth: true
@@ -94,10 +100,18 @@ ApplicationWindow {
         }
     }
 
+    // Open Storage Setting Dialog
+    StorageSettingsPopup {
+        id: storageSettingsPopup
+    }
+
     Connections {
         target: bridge
         function onErrorOccurred(message) {
             errorLabel.text = message;
+        }
+        function onStorageCritical(message) {
+            errorLabel.text = "STORAGE CRITICAL: " + message;
         }
     }
 

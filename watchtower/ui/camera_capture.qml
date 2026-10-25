@@ -10,9 +10,24 @@ Rectangle {
 
     property var device: null
     property string title: "Screen Capture"
+    property bool isRecording: false
 
     color: "#1a1a1a"
     radius: 4
+
+    function updateRecordingState() {
+        root.isRecording = bridge && bridge.captureManager && root.device
+            ? bridge.captureManager.isDeviceRecording(root.device.deviceId)
+            : false;
+    }
+
+    Component.onCompleted: {
+        updateRecordingState();
+    }
+
+    onDeviceChanged: {
+        updateRecordingState();
+    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -82,14 +97,72 @@ Rectangle {
                 wrapMode: Text.Wrap
             }
 
-            // Manual record button - functionality not implemented yet.
-            Button {
-                text: "Record"
-                enabled: false
-                Layout.alignment: Qt.AlignLeft
-                // onClicked: {
-                //     // TODO: wire to CaptureSessionManager.startRecording()
-                // }
+            // Recording controls
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 12
+
+                Button {
+                    id: recordButton
+                    text: "Record"
+                    visible: !root.isRecording
+                    enabled: root.device !== null
+                    Layout.alignment: Qt.AlignLeft
+                    onClicked: {
+                        if (bridge && bridge.captureManager && root.device) {
+                            recordingPopup.deviceId = root.device.deviceId;
+                            recordingPopup.deviceDescription = root.device.description;
+                            recordingPopup.open();
+                        }
+                    }
+                }
+
+                Button {
+                    id: stopButton
+                    text: "Stop Recording"
+                    visible: root.isRecording
+                    Layout.alignment: Qt.AlignLeft
+                    onClicked: {
+                        if (bridge && bridge.captureManager && root.device) {
+                            bridge.captureManager.stopRecordingForDevice(root.device.deviceId);
+                        }
+                    }
+                }
+
+                RowLayout {
+                    visible: root.isRecording
+                    spacing: 6
+
+                    Rectangle {
+                        width: 12
+                        height: 12
+                        radius: 6
+                        color: "red"
+                    }
+
+                    Label {
+                        text: "Recording"
+                        color: "white"
+                    }
+                }
+            }
+        }
+    }
+
+    RecordingPopup {
+        id: recordingPopup
+        onStartRecording: folderPath => {
+            if (bridge && bridge.captureManager && root.device) {
+                bridge.captureManager.startRecordingForDevice(root.device.deviceId, folderPath);
+            }
+        }
+    }
+
+    Connections {
+        target: bridge ? bridge.captureManager : null
+        function onDeviceRecordingStateChanged(deviceId, recording) {
+            if (root.device && deviceId === root.device.deviceId) {
+                root.isRecording = recording;
             }
         }
     }
