@@ -2,13 +2,20 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from PySide6.QtCore import QUrl
 from PySide6.QtMultimedia import QMediaRecorder
 
 from backend.capture_session_worker import (
     CaptureSessionWorker,
     _sanitize_filename,
 )
+
+
+@pytest.fixture
+def capture_worker(qtbot):
+    """Create a CaptureSessionWorker and ensure it is deleted after the test."""
+    worker = CaptureSessionWorker("cam-1")
+    yield worker
+    worker.deleteLater()
 
 
 def test_sanitize_filename_with_special_characters():
@@ -23,12 +30,11 @@ def test_sanitize_filename_empty():
     assert _sanitize_filename("!!!") == "camera"
 
 
-def test_generate_output_path_uses_folder_and_suffix(temp_folder):
-    worker = CaptureSessionWorker("cam-1")
-    worker._camera_device = MagicMock()
-    worker._camera_device.description.return_value = "Test Camera"
+def test_generate_output_path_uses_folder_and_suffix(capture_worker, temp_folder):
+    capture_worker._camera_device = MagicMock()
+    capture_worker._camera_device.description.return_value = "Test Camera"
 
-    path = worker._generate_output_path(str(temp_folder))
+    path = capture_worker._generate_output_path(str(temp_folder))
     path_obj = Path(path)
 
     assert path_obj.parent == temp_folder
@@ -36,108 +42,107 @@ def test_generate_output_path_uses_folder_and_suffix(temp_folder):
     assert path_obj.name.startswith("test-camera_")
 
 
-def test_set_video_sink_ignores_wrong_device_id(qtbot):
-    worker = CaptureSessionWorker("cam-1")
+def test_set_video_sink_ignores_wrong_device_id(capture_worker):
     sink = MagicMock()
-    worker.setVideoSink("cam-2", sink)
-    assert worker._video_sink is None
+    capture_worker.setVideoSink("cam-2", sink)
+    assert capture_worker._video_sink is None
 
 
-def test_clear_video_sink_ignores_wrong_device_id(qtbot):
-    worker = CaptureSessionWorker("cam-1")
-    worker._video_sink = MagicMock()
-    worker.clearVideoSink("cam-2")
-    assert worker._video_sink is not None
+def test_clear_video_sink_ignores_wrong_device_id(capture_worker):
+    capture_worker._video_sink = MagicMock()
+    capture_worker.clearVideoSink("cam-2")
+    assert capture_worker._video_sink is not None
 
 
-def test_start_recording_ignores_wrong_device_id(qtbot):
-    worker = CaptureSessionWorker("cam-1")
-    with qtbot.assertNotEmitted(worker.errorOccurred):
-        worker.startRecording("cam-2", "/tmp/out")
+def test_start_recording_ignores_wrong_device_id(qtbot, capture_worker):
+    with qtbot.assertNotEmitted(capture_worker.errorOccurred):
+        capture_worker.startRecording("cam-2", "/tmp/out")
 
 
-def test_start_recording_rejects_invalid_path(qtbot):
-    worker = CaptureSessionWorker("cam-1")
-    with qtbot.waitSignal(worker.errorOccurred, timeout=1000):
-        worker.startRecording("cam-1", "")
+def test_start_recording_rejects_invalid_path(qtbot, capture_worker):
+    with qtbot.waitSignal(capture_worker.errorOccurred, timeout=1000):
+        capture_worker.startRecording("cam-1", "")
 
 
-def test_stop_recording_sets_stop_requested(qtbot):
-    worker = CaptureSessionWorker("cam-1")
-    worker.stopRecording("cam-1")
-    assert worker._stop_requested is True
+def test_stop_recording_sets_stop_requested(capture_worker):
+    capture_worker.stopRecording("cam-1")
+    assert capture_worker._stop_requested is True
 
 
-def test_recorder_state_change_emits_recording_started(qtbot):
-    worker = CaptureSessionWorker("cam-1")
-    worker._recorder = MagicMock()
+def test_recorder_state_change_emits_recording_started(qtbot, capture_worker):
+    capture_worker._recorder = MagicMock()
 
-    with qtbot.waitSignal(worker.recordingStateChanged, timeout=1000):
-        worker._on_recorder_state_changed(QMediaRecorder.RecorderState.RecordingState)
+    with qtbot.waitSignal(capture_worker.recordingStateChanged, timeout=1000):
+        capture_worker._on_recorder_state_changed(QMediaRecorder.RecorderState.RecordingState)
 
-    assert worker._is_recording is True
-
-
-def test_recorder_state_change_emits_recording_stopped(qtbot):
-    worker = CaptureSessionWorker("cam-1")
-    worker._recorder = MagicMock()
-    worker._stop_requested = True
-    worker._is_recording = True
-
-    with qtbot.waitSignal(worker.recordingStateChanged, timeout=1000):
-        worker._on_recorder_state_changed(QMediaRecorder.RecorderState.StoppedState)
-
-    assert worker._is_recording is False
+    assert capture_worker._is_recording is True
 
 
-def test_recorder_error_emits_error_stops_recording_and_triggers_fatal_signal(qtbot):
-    worker = CaptureSessionWorker("cam-1")
-    worker._recorder = MagicMock()
-    worker._is_recording = True
+def test_recorder_state_change_emits_recording_stopped(qtbot, capture_worker):
+    capture_worker._recorder = MagicMock()
+    capture_worker._stop_requested = True
+    capture_worker._is_recording = True
+
+    with qtbot.waitSignal(capture_worker.recordingStateChanged, timeout=1000):
+        capture_worker._on_recorder_state_changed(QMediaRecorder.RecorderState.StoppedState)
+
+    assert capture_worker._is_recording is False
+
+
+def test_recorder_error_emits_error_stops_recording_and_triggers_fatal_signal(qtbot, capture_worker):
+    capture_worker._recorder = MagicMock()
+    capture_worker._is_recording = True
 
     with qtbot.waitSignals(
-        [worker.errorOccurred, worker.recordingStateChanged], timeout=1000
+        [capture_worker.errorOccurred, capture_worker.recordingStateChanged], timeout=1000
     ):
-        worker._on_recorder_error(QMediaRecorder.Error.ResourceError, "disk full")
+        capture_worker._on_recorder_error(QMediaRecorder.Error.ResourceError, "disk full")
 
-    assert worker._segment_start_failed is True
+    assert capture_worker._segment_start_failed is True
 
-    with qtbot.waitSignal(worker.fatalErrorOccurred, timeout=1000):
-        worker._on_recorder_state_changed(QMediaRecorder.RecorderState.StoppedState)
+    with qtbot.waitSignal(capture_worker.fatalErrorOccurred, timeout=1000):
+        capture_worker._on_recorder_state_changed(QMediaRecorder.RecorderState.StoppedState)
 
-    assert worker._is_recording is False
-
-
-def test_stop_emits_stopped_signal(qtbot):
-    worker = CaptureSessionWorker("cam-1")
-    worker._recorder = MagicMock()
-    worker._camera = MagicMock()
-    worker._session = MagicMock()
-
-    with qtbot.waitSignal(worker.stopped, timeout=1000):
-        worker.stop()
-
-    assert worker._is_recording is False
+    assert capture_worker._is_recording is False
 
 
-def test_start_next_segment_failure_emits_fatal_error(qtbot):
-    worker = CaptureSessionWorker("cam-1")
-    worker._recorder = MagicMock()
-    worker._output_folder = "/nonexistent/path/that/cannot/be/created"
+def test_stop_emits_stopped_signal(qtbot, capture_worker):
+    capture_worker._recorder = MagicMock()
+    capture_worker._camera = MagicMock()
+    capture_worker._session = MagicMock()
+
+    with qtbot.waitSignal(capture_worker.stopped, timeout=1000):
+        capture_worker.stop()
+
+    assert capture_worker._is_recording is False
+
+
+def test_start_next_segment_failure_emits_fatal_error(qtbot, capture_worker, tmp_path):
+    # Create a file where the worker expects a folder so _ensure_output_folder fails
+    # deterministically on both Unix and Windows.
+    blocked_folder = tmp_path / "not_a_dir"
+    blocked_folder.write_text("x")
+
+    capture_worker._recorder = MagicMock()
+    capture_worker._output_folder = str(blocked_folder)
 
     with qtbot.waitSignals(
-        [worker.errorOccurred, worker.fatalErrorOccurred], timeout=1000
+        [capture_worker.errorOccurred, capture_worker.fatalErrorOccurred], timeout=1000
     ):
-        worker._start_next_segment()
+        capture_worker._start_next_segment()
 
-    assert worker._is_recording is False
+    assert capture_worker._is_recording is False
 
 
-def test_start_recording_failure_emits_fatal_error(qtbot):
-    worker = CaptureSessionWorker("cam-1")
-    worker._recorder = MagicMock()
+def test_start_recording_failure_emits_fatal_error(qtbot, capture_worker, tmp_path):
+    # Create a file where the worker expects a folder so _ensure_output_folder fails
+    # deterministically on both Unix and Windows.
+    blocked_folder = tmp_path / "not_a_dir"
+    blocked_folder.write_text("x")
+
+    capture_worker._recorder = MagicMock()
 
     with qtbot.waitSignals(
-        [worker.errorOccurred, worker.fatalErrorOccurred], timeout=1000
+        [capture_worker.errorOccurred, capture_worker.fatalErrorOccurred], timeout=1000
     ):
-        worker.startRecording("cam-1", "/nonexistent/path/that/cannot/be/created")
+        capture_worker.startRecording("cam-1", str(blocked_folder))
