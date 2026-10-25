@@ -54,6 +54,12 @@ jobs:
           python-version: '3.14'
           enable-cache: true
 
+      - name: Install Qt runtime dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libglx-mesa0 libpulse0
+
       - name: Install dependencies
         run: uv sync --locked
 
@@ -65,4 +71,4 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: watchtower-${{ matrix.os }}
-          path: dist/Watchtower*
+          path: watchtower/dist/Watchtower*
