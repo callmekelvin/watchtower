@@ -25,6 +25,10 @@ class CaptureSessionManager(QObject):
     # Emitted when a segment file has been finalized (Arg: device_id, finalized_file_path)
     segmentFinalized = Signal(str, str)
 
+    # Emitted when a worker reports a recording failure that should terminate the app.
+    # Arg: message
+    fatalErrorOccurred = Signal(str)
+
     # Internal signals used to deliver sink changes to workers on their own threads - Emit to all Camera Threads (Arg: device_id, Sink)
     _setWorkerVideoSink = Signal(str, QVideoSink)
     _clearWorkerVideoSink = Signal(str)
@@ -212,6 +216,10 @@ class CaptureSessionManager(QObject):
         # Wire worker signals back to manager with Qt.QueuedConnection so they execute on the GUI threa
         worker.sessionReady.connect(self._on_session_ready, Qt.QueuedConnection)
         worker.errorOccurred.connect(self._on_worker_error, Qt.QueuedConnection)
+        worker.fatalErrorOccurred.connect(
+            lambda device_id, msg: self.fatalErrorOccurred.emit(f"[{device_id}] {msg}"),
+            Qt.QueuedConnection,
+        )
         worker.stopped.connect(self._on_worker_stopped, Qt.QueuedConnection)
 
         # Start Thread/ Worker

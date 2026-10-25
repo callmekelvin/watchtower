@@ -1,5 +1,6 @@
 import sys
 import os
+import platform
 
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
@@ -18,6 +19,11 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 def main():
+    # For Linux, don't autoset encoding
+    # Qt Multimedia's FFmpeg backend on Linux auto-selects VAAPI for H.264 encoding
+    if platform.system() == "Linux":
+        os.environ.setdefault("QT_FFMPEG_ENCODING_HW_DEVICE_TYPES", "")
+
     # Create QT UI Application
     app = QGuiApplication(sys.argv)
     engine = QQmlApplicationEngine()
@@ -34,6 +40,14 @@ def main():
 
     # Adapter layer that exposes backend state to QML
     bridge = QmlBridge(device_manager, capture_manager, storage_manager)
+
+    # A fatal recording error should terminate the application rather than
+    # repeatedly attempting to restart recording.
+    def _on_fatal_error(message: str) -> None:
+        print(f"FATAL: {message}", file=sys.stderr)
+        app.exit(1)
+
+    bridge.fatalErrorOccurred.connect(_on_fatal_error)
 
     # Ensure background threads shut down cleanly before the app exits
     app.aboutToQuit.connect(capture_manager.shutdown)

@@ -153,6 +153,8 @@ graph TB
   - Skips files listed as protected (currently being written by an active recording).
   - Emits `purgedFiles` or `purgeFailed`.
 
+> **Note on multi-volume setups:** The storage purge worker currently measures free space against a single root path. If active recording folders and managed folders reside on different volumes, the purge may check free space on one volume while deleting files from another. For now, keep all purged recordings on the same volume, or trigger manual purges with care.
+
 ### Data Models
 
 - **`backend/models.py`**

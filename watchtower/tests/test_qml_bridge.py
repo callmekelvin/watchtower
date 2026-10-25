@@ -36,6 +36,7 @@ class FakeCaptureManager(QObject):
     currentDeviceIdChanged = Signal()
     cameraActiveChanged = Signal()
     errorOccurred = Signal(str)
+    fatalErrorOccurred = Signal(str)
     sessionStarted = Signal(str)
     sessionStopped = Signal(str)
     deviceRecordingStateChanged = Signal(str, bool)

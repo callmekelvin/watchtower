@@ -127,6 +127,22 @@ def test_on_purge_due_returns_early_when_no_folders_to_scan(storage_manager):
     storage_manager._dispatchPurge.assert_not_called()
 
 
+def test_on_purge_due_emits_min_free_bytes_without_overflow(storage_manager):
+    """Large min-free-space values must survive the cross-thread signal as qint64."""
+    storage_manager._min_free_space_gb = 5
+    storage_manager._max_retention_days = 30
+    storage_manager._purge_active_only = True
+    storage_manager._active_folders = ["/tmp/active"]
+    storage_manager._protected_files = set()
+    storage_manager._dispatchPurge = MagicMock()
+
+    storage_manager._on_purge_due()
+
+    args = storage_manager._dispatchPurge.emit.call_args[0]
+    assert args[4] == 5 * 1024 ** 3  # min_free_bytes
+    assert args[5] == 30 * 24 * 60 * 60  # max_retention_seconds
+
+
 def test_update_active_folders(storage_manager):
     storage_manager.updateActiveFolders(["/tmp/folder"], {"/tmp/folder/file.mp4"})
     assert storage_manager._active_folders == ["/tmp/folder"]
