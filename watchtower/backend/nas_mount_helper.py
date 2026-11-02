@@ -2,8 +2,12 @@ import os
 import platform
 import re
 import shutil
+import signal
+import socket
 import string
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -82,12 +86,56 @@ def ensure_mount_point_dir(mount_point: Path) -> None:
     mount_point.mkdir(parents=True, exist_ok=True)
 
 
+# Default NFS mount options used to make the mount fail fast instead of
+# hanging the recorder thread when the network drops.
+_DEFAULT_NFS_OPTIONS = ["soft", "timeo=50", "retrans=3"]
+
+
+def _build_nfs_options(connection: NasConnection) -> str:
+    """Build an NFS options string with resilience defaults appended.
+
+    User-supplied options are preserved and defaults are only added when
+    they (or a conflicting option) are not already present.
+    """
+    parts: List[str] = []
+    if connection.mount_options:
+        parts = [opt.strip() for opt in connection.mount_options.split(",") if opt.strip()]
+
+    # Ensure a read/write option is present unless the user specified ro/rw.
+    if not any(p.lower() in ("rw", "ro") for p in parts):
+        parts.insert(0, "rw")
+
+    existing_keys = {p.split("=", 1)[0].lower(): p for p in parts}
+
+    for default in _DEFAULT_NFS_OPTIONS:
+        key = default.split("=", 1)[0].lower()
+        # Do not override an explicit soft/hard choice.
+        if key == "soft" and ("soft" in existing_keys or "hard" in existing_keys):
+            continue
+        if key in existing_keys:
+            continue
+        parts.append(default)
+
+    return ",".join(parts)
+
+
 def is_mount_healthy(mount_point: Path) -> bool:
-    """Return True if the mount point exists and is writable."""
+    """Return True if the mount point exists and is writable.
+
+    For NAS mount points the writability check is performed in a subprocess
+    so a stale network mount cannot hang the caller.
+    """
     try:
-        return mount_point.exists() and os.access(str(mount_point), os.W_OK)
+        if not mount_point.exists():
+            return False
     except OSError:
         return False
+
+    path_str = str(mount_point)
+    if is_likely_nas_mount(path_str):
+        return is_nas_path_reachable(path_str)
+
+    return os.access(path_str, os.W_OK)
 
 
 # ---------------------------------------------------------------------------
@@ -169,9 +217,8 @@ def _build_linux_mount(
 
     if connection.protocol == NasProtocol.NFS:
         source = f"{host}:/{share}"
-        cmd = ["sudo", "mount", "-t", "nfs", source, str(mount_point), "-o", "rw"]
-        if connection.mount_options:
-            cmd[-1] = f"rw,{connection.mount_options}"
+        options = _build_nfs_options(connection)
+        cmd = ["sudo", "mount", "-t", "nfs", source, str(mount_point), "-o", options]
         return cmd, {}
 
     raise ValueError(f"Unsupported protocol: {connection.protocol}")
@@ -204,9 +251,8 @@ def _build_macos_mount(
 
     if connection.protocol == NasProtocol.NFS:
         source = f"{host}:/{share}"
-        cmd = ["sudo", "mount", "-t", "nfs", source, str(mount_point)]
-        if connection.mount_options:
-            cmd.extend(["-o", connection.mount_options])
+        options = _build_nfs_options(connection)
+        cmd = ["sudo", "mount", "-t", "nfs", source, str(mount_point), "-o", options]
         return cmd, {}
 
     raise ValueError(f"Unsupported protocol: {connection.protocol}")
@@ -247,13 +293,13 @@ def _build_windows_mount(
 
     if connection.protocol == NasProtocol.NFS:
         # Windows NFS client syntax (requires the Optional Features NFS client).
+        options = _build_nfs_options(connection)
         cmd = [
             "mount",
             f"{host}:/{share}",
             f"{drive_letter}:",
         ]
-        if connection.mount_options:
-            cmd[1:1] = ["-o:" + connection.mount_options]
+        cmd[1:1] = ["-o:" + options]
         return cmd, {}, drive_letter
 
     raise ValueError(f"Unsupported protocol: {connection.protocol}")
@@ -262,6 +308,8 @@ def _build_windows_mount(
 def build_unmount_command(
     mount_point: Path,
     drive_letter: Optional[str] = None,
+    lazy: bool = False,
+    force: bool = False,
 ) -> Tuple[List[str], Optional[str]]:
     """Build an unmount command for the current platform.
 
@@ -273,9 +321,16 @@ def build_unmount_command(
         if drive_letter is None:
             raise ValueError("Windows unmount requires a drive letter")
         return ["net", "use", f"{drive_letter}:", "/delete"], drive_letter
+
+    flags: List[str] = []
+    if lazy:
+        flags.append("-l")
+    if force:
+        flags.append("-f")
+
     if system == "Darwin":
-        return ["sudo", "umount", str(mount_point)], None
-    return ["sudo", "umount", str(mount_point)], None
+        return ["sudo", "umount", *flags, str(mount_point)], None
+    return ["sudo", "umount", *flags, str(mount_point)], None
 
 
 def build_junction_command(
@@ -394,6 +449,8 @@ def _mount_windows(
 def unmount_share(
     mount_point: Path,
     drive_letter: Optional[str] = None,
+    lazy: bool = False,
+    force: bool = False,
 ) -> Tuple[bool, Optional[str]]:
     """Unmount a previously mounted share.
 
@@ -409,7 +466,7 @@ def unmount_share(
             return False, f"Unmount failed ({result.returncode}): {result.stderr or result.stdout}"
         return True, None
 
-    cmd, _ = build_unmount_command(mount_point, drive_letter)
+    cmd, _ = build_unmount_command(mount_point, drive_letter, lazy=lazy, force=force)
     result = _run_subprocess(cmd)
     if result.returncode != 0:
         return False, f"Unmount failed ({result.returncode}): {result.stderr or result.stdout}"
@@ -480,6 +537,65 @@ def _parse_windows_wmic_output(output: str, path: str) -> Optional[float]:
             except ValueError:
                 continue
     return None
+
+
+def check_host_port(host: str, port: int, timeout: float = 2.0) -> bool:
+    """Return True if a TCP connection to ``host:port`` can be established."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _run_probe_subprocess(script: str, path: str, timeout: float) -> bool:
+    """Run a short Python probe in a subprocess and return True on success."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            start_new_session=True,
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+    except OSError:
+        return False
+
+
+def probe_nas_write(mount_point: Path, timeout: float = 3.0) -> Tuple[bool, Optional[str]]:
+    """Write and delete a unique timestamped file to verify writability.
+
+    The probe runs in a separate subprocess so a stale NFS mount cannot
+    block the calling thread. Returns (success, error_message).
+    """
+    script = (
+        "import os, sys, time\n"
+        "path = sys.argv[1]\n"
+        "probe = os.path.join(path, '.watchtower_probe_' + str(int(time.time() * 1000)))\n"
+        "with open(probe, 'w') as f:\n"
+        "    f.write('ok')\n"
+        "os.remove(probe)\n"
+    )
+    if _run_probe_subprocess(script, str(mount_point), timeout):
+        return True, None
+    return False, f"Write probe timed out or failed for {mount_point}"
+
+
+def is_nas_path_reachable(path: str, timeout: float = 3.0) -> bool:
+    """Return True if ``path`` is a writable directory.
+
+    This is executed in a subprocess so a stale network mount cannot hang
+    the caller.
+    """
+    script = (
+        "import os, sys\n"
+        "path = sys.argv[1]\n"
+        "sys.exit(0 if os.path.isdir(path) and os.access(path, os.W_OK) else 1)\n"
+    )
+    return _run_probe_subprocess(script, path, timeout)
 
 
 def is_likely_nas_mount(path: str) -> bool:

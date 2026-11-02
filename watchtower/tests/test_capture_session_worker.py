@@ -8,6 +8,7 @@ from backend.capture_session_worker import (
     CaptureSessionWorker,
     _sanitize_filename,
 )
+from backend.nas_mount_helper import is_likely_nas_mount
 
 
 @pytest.fixture
@@ -146,3 +147,66 @@ def test_start_recording_failure_emits_fatal_error(qtbot, capture_worker, tmp_pa
         [capture_worker.errorOccurred, capture_worker.fatalErrorOccurred], timeout=1000
     ):
         capture_worker.startRecording("cam-1", str(blocked_folder))
+
+
+def test_nas_health_check_emits_recording_paused(qtbot, capture_worker, monkeypatch):
+    capture_worker._recorder = MagicMock()
+    capture_worker._is_recording = True
+    capture_worker._output_folder = "/tmp/watchtower/mounts/conn-1/cam"
+    capture_worker._nas_host = "nas"
+    capture_worker._nas_port = 2049
+
+    monkeypatch.setattr(
+        "backend.capture_session_worker.check_host_port", lambda *args, **kwargs: False
+    )
+    monkeypatch.setattr(
+        "backend.capture_session_worker.is_likely_nas_mount", lambda _path: True
+    )
+
+    with qtbot.waitSignal(capture_worker.recordingPaused, timeout=1000) as blocker:
+        capture_worker._on_nas_health_check()
+
+    assert "unreachable" in blocker.args[1].lower()
+    assert capture_worker._nas_paused is True
+
+
+def test_start_recording_nas_unreachable_emits_paused_not_fatal(
+    qtbot, capture_worker, monkeypatch
+):
+    capture_worker._recorder = MagicMock()
+    nas_folder = "/tmp/watchtower/mounts/conn-1/cam"
+
+    monkeypatch.setattr(
+        "backend.capture_session_worker.check_host_port", lambda *args, **kwargs: False
+    )
+    monkeypatch.setattr(
+        "backend.capture_session_worker.is_likely_nas_mount", lambda path: True
+    )
+
+    with qtbot.waitSignal(capture_worker.recordingPaused, timeout=1000):
+        with qtbot.assertNotEmitted(capture_worker.fatalErrorOccurred):
+            capture_worker.startRecording("cam-1", nas_folder, nas_host="nas")
+
+    assert capture_worker._nas_paused is True
+
+
+def test_start_next_segment_nas_unreachable_emits_paused_not_fatal(
+    qtbot, capture_worker, monkeypatch
+):
+    capture_worker._recorder = MagicMock()
+    capture_worker._output_folder = "/tmp/watchtower/mounts/conn-1/cam"
+    capture_worker._nas_host = "nas"
+    capture_worker._nas_port = 2049
+
+    monkeypatch.setattr(
+        "backend.capture_session_worker.check_host_port", lambda *args, **kwargs: False
+    )
+    monkeypatch.setattr(
+        "backend.capture_session_worker.is_likely_nas_mount", lambda path: True
+    )
+
+    with qtbot.waitSignal(capture_worker.recordingPaused, timeout=1000):
+        with qtbot.assertNotEmitted(capture_worker.fatalErrorOccurred):
+            capture_worker._start_next_segment()
+
+    assert capture_worker._nas_paused is True

@@ -132,3 +132,83 @@ def test_start_recording_to_nas_delegates_to_nas_manager(capture_manager):
     capture_manager.startRecordingToNas("cam-1", "conn-1")
     nas.mountForRecording.assert_called_once_with("conn-1", "cam-1")
     assert capture_manager._pending_nas_recordings["cam-1"] == "conn-1"
+
+
+def test_nas_recording_path_ready_sets_desired_and_registers_watch(capture_manager):
+    nas = MagicMock()
+    nas.connectionHost.return_value = "nas"
+    capture_manager._nas_manager = nas
+
+    capture_manager.startRecordingToNas("cam-1", "conn-1")
+    capture_manager._on_nas_recording_path_ready("cam-1", "/nas/cam")
+
+    assert capture_manager._desired_nas_recordings["cam-1"] == "conn-1"
+    nas.registerRecoveryWatch.assert_called_once_with("conn-1")
+
+
+def test_worker_recording_paused_moves_to_paused_state(qtbot, capture_manager):
+    nas = MagicMock()
+    capture_manager._nas_manager = nas
+    capture_manager._desired_nas_recordings["cam-1"] = "conn-1"
+    capture_manager._active_nas_recordings["cam-1"] = "conn-1"
+    capture_manager._recording_folders["cam-1"] = "/nas/cam"
+
+    with qtbot.waitSignal(capture_manager.errorOccurred, timeout=1000):
+        capture_manager._on_worker_recording_paused("cam-1", "NAS unreachable")
+
+    assert "cam-1" not in capture_manager._active_nas_recordings
+    assert capture_manager._paused_nas_recordings["cam-1"] == "conn-1"
+    nas.setNasRecordingActive.assert_called_once_with("cam-1", "conn-1", False)
+    assert "cam-1" not in capture_manager._recording_folders
+
+
+def test_connection_restored_resumes_paused_recordings(capture_manager, qtbot):
+    nas = MagicMock()
+    nas.ensureRecordingPath.return_value = "/nas/cam_1"
+    nas.connectionHost.return_value = "nas"
+    capture_manager._nas_manager = nas
+    capture_manager._workers["cam-1"] = MagicMock()
+
+    capture_manager._desired_nas_recordings["cam-1"] = "conn-1"
+    capture_manager._paused_nas_recordings["cam-1"] = "conn-1"
+
+    with qtbot.waitSignal(capture_manager._startRecordingForWorker, timeout=1000):
+        capture_manager._on_nas_connection_restored("conn-1")
+
+    assert "cam-1" not in capture_manager._paused_nas_recordings
+    assert capture_manager._active_nas_recordings["cam-1"] == "conn-1"
+    nas.ensureRecordingPath.assert_called_once_with("conn-1", "cam-1")
+
+
+def test_manual_disconnect_clears_desired_and_paused(capture_manager):
+    capture_manager._desired_nas_recordings["cam-1"] = "conn-1"
+    capture_manager._paused_nas_recordings["cam-1"] = "conn-1"
+    capture_manager._active_nas_recordings["cam-1"] = "conn-1"
+
+    capture_manager._on_nas_connection_manually_disconnected("conn-1")
+
+    assert capture_manager._desired_nas_recordings == {}
+    assert capture_manager._paused_nas_recordings == {}
+    assert capture_manager._active_nas_recordings == {}
+
+
+def test_stop_recording_for_device_unregisters_watch(capture_manager):
+    nas = MagicMock()
+    capture_manager._nas_manager = nas
+    capture_manager._desired_nas_recordings["cam-1"] = "conn-1"
+    capture_manager._nas_watch_refs["conn-1"] = 1
+
+    capture_manager.stopRecordingForDevice("cam-1")
+
+    assert "cam-1" not in capture_manager._desired_nas_recordings
+    nas.unregisterRecoveryWatch.assert_called_once_with("conn-1")
+
+
+def test_start_recording_to_nas_ignores_already_desired_device(capture_manager):
+    nas = MagicMock()
+    capture_manager._nas_manager = nas
+    capture_manager._desired_nas_recordings["cam-1"] = "conn-1"
+
+    capture_manager.startRecordingToNas("cam-1", "conn-1")
+
+    nas.mountForRecording.assert_not_called()

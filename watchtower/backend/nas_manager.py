@@ -3,16 +3,18 @@ import platform
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
-from PySide6.QtCore import QObject, QSettings, Signal, Slot, Property
+from PySide6.QtCore import QObject, QSettings, Signal, Slot, Property, QThread, QTimer
 
 from backend.nas_connection import NasConnection, NasProtocol
 from backend.nas_mount_helper import (
+    check_host_port,
     find_available_drive_letter,
     get_default_mount_point,
     is_mount_healthy,
     mount_share,
+    probe_nas_write,
     unmount_share,
 )
 
@@ -21,6 +23,169 @@ from backend.nas_mount_helper import (
 class _MountState:
     mount_point: Path
     drive_letter: Optional[str] = None
+
+
+class NasMountWorker(QObject):
+    """Background worker that unmounts a stale share and remounts it."""
+
+    # connection_id, success, error, mount_point_str, drive_letter
+    finished = Signal(str, bool, str, str, str)
+
+    def __init__(
+        self,
+        connection: NasConnection,
+        previous_state: Optional[_MountState] = None,
+        parent: QObject | None = None,
+    ):
+        super().__init__(parent)
+        self._connection = connection
+        self._previous_state = previous_state
+
+    @Slot()
+    def perform_mount(self) -> None:
+        try:
+            mount_point = get_default_mount_point(self._connection.id)
+
+            if self._previous_state is not None:
+                unmount_share(
+                    self._previous_state.mount_point,
+                    self._previous_state.drive_letter,
+                    lazy=True,
+                )
+
+            drive_letter = (
+                find_available_drive_letter()
+                if platform.system() == "Windows"
+                else None
+            )
+
+            success, used_drive_letter, error = mount_share(
+                self._connection, mount_point, "", drive_letter
+            )
+
+            if success:
+                probe_ok, probe_err = probe_nas_write(mount_point)
+                if not probe_ok:
+                    unmount_share(mount_point, used_drive_letter, lazy=True)
+                    success = False
+                    error = probe_err or "NAS write probe failed"
+                else:
+                    self.finished.emit(
+                        self._connection.id,
+                        True,
+                        "",
+                        str(mount_point),
+                        used_drive_letter or "",
+                    )
+                    return
+
+            self.finished.emit(
+                self._connection.id, False, error or "Mount failed", "", ""
+            )
+        except Exception as exc:
+            self.finished.emit(self._connection.id, False, str(exc), "", "")
+
+
+class NasRecoveryWatcher(QObject):
+    """Watches NAS connections used for recording and remounts them on outage."""
+
+    connectionRestored = Signal(str)
+    connectionRestoreFailed = Signal(str, str)
+
+    def __init__(self, nas_manager: "NasManager", parent: QObject | None = None):
+        super().__init__(parent)
+        self._nas = nas_manager
+        self._watched: Set[str] = set()
+        self._in_progress: Set[str] = set()
+        # Keep workers alive while their background threads are running.
+        self._active_workers: Set[QObject] = set()
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(60_000)  # 60 seconds
+        self._timer.timeout.connect(self._on_tick)
+
+    def watch(self, connection_id: str) -> None:
+        """Start watching a connection for auto-recovery."""
+        self._watched.add(connection_id)
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def unwatch(self, connection_id: str) -> None:
+        """Stop watching a connection for auto-recovery."""
+        self._watched.discard(connection_id)
+        self._in_progress.discard(connection_id)
+        if not self._watched:
+            self._timer.stop()
+
+    def unwatch_all(self) -> None:
+        """Stop watching all connections."""
+        self._watched.clear()
+        self._in_progress.clear()
+        self._timer.stop()
+
+    def _on_tick(self) -> None:
+        for connection_id in list(self._watched):
+            if connection_id in self._in_progress:
+                continue
+            if self._nas._is_mounted_and_healthy(connection_id):
+                continue
+            self._attempt_remount(connection_id)
+
+    def _attempt_remount(self, connection_id: str) -> None:
+        conn = self._nas._connections.get(connection_id)
+        if conn is None:
+            return
+
+        # Remove stale state so the UI shows disconnected while we retry.
+        previous_state = self._nas._mount_states.pop(connection_id, None)
+        self._in_progress.add(connection_id)
+
+        thread = QThread(self)
+        worker = NasMountWorker(conn, previous_state)
+        self._active_workers.add(worker)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.perform_mount)
+        worker.finished.connect(self._on_mount_finished)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(self._cleanup_worker)
+
+        self._nas._recovery_threads[connection_id] = thread
+        thread.start()
+
+    def _cleanup_worker(self) -> None:
+        """Delete a finished worker once its thread has quit."""
+        thread = self.sender()
+        for worker in list(self._active_workers):
+            if worker.thread() is thread:
+                self._active_workers.discard(worker)
+                worker.deleteLater()
+                break
+        if thread is not None:
+            thread.deleteLater()
+
+    def _on_mount_finished(
+        self,
+        connection_id: str,
+        success: bool,
+        error: str,
+        mount_point_str: str,
+        drive_letter: str,
+    ) -> None:
+        self._in_progress.discard(connection_id)
+        self._nas._recovery_threads.pop(connection_id, None)
+
+        if success:
+            mount_point = Path(mount_point_str)
+            self._nas._mount_states[connection_id] = _MountState(
+                mount_point, drive_letter or None
+            )
+            self._nas.connectionStatusChanged.emit()
+            print(f"[NasRecovery] Connection {connection_id} restored")
+            self.connectionRestored.emit(connection_id)
+        else:
+            print(f"[NasRecovery] Failed to restore {connection_id}: {error}")
+            self.connectionRestoreFailed.emit(connection_id, error or "Unknown error")
 
 
 class NasManager(QObject):
@@ -52,6 +217,16 @@ class NasManager(QObject):
     # Emitted when the set of active NAS recordings changes.
     anyNasRecordingActiveChanged = Signal()
 
+    # Emitted when a watched connection is remounted after an outage.
+    connectionRestored = Signal(str)
+
+    # Emitted when a watched connection could not be remounted.
+    connectionRestoreFailed = Signal(str, str)
+
+    # Emitted when the user manually disconnects a connection.
+    # This lets the recording manager cancel auto-recovery.
+    connectionManuallyDisconnected = Signal(str)
+
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
 
@@ -64,6 +239,15 @@ class NasManager(QObject):
         self._pending_operation: Optional[str] = None
         # device_id -> connection_id for active NAS recordings.
         self._active_recordings: Dict[str, str] = {}
+
+        # Tracks background recovery threads so they can be cleaned up.
+        self._recovery_threads: Dict[str, QThread] = {}
+
+        self._recovery_watcher = NasRecoveryWatcher(self)
+        self._recovery_watcher.connectionRestored.connect(self.connectionRestored)
+        self._recovery_watcher.connectionRestoreFailed.connect(
+            self.connectionRestoreFailed
+        )
 
         self._load_connections()
 
@@ -108,6 +292,7 @@ class NasManager(QObject):
         """Delete a configured NAS connection."""
         if connection_id in self._mount_states:
             self.requestDisconnect(connection_id)
+        self._recovery_watcher.unwatch(connection_id)
         self._connections.pop(connection_id, None)
         self._save_connections()
         self.connectionStatusChanged.emit()
@@ -147,9 +332,13 @@ class NasManager(QObject):
             )
             return
 
+        # A manual disconnect is a human failsafe: stop auto-recovery.
+        self._recovery_watcher.unwatch(connection_id)
+
         state = self._mount_states.pop(connection_id, None)
         if state is None:
             self.connectionStatusChanged.emit()
+            self.connectionManuallyDisconnected.emit(connection_id)
             return
 
         success, error = unmount_share(state.mount_point, state.drive_letter)
@@ -159,6 +348,7 @@ class NasManager(QObject):
             self.errorOccurred.emit(error or "Failed to disconnect NAS")
         else:
             self.connectionStatusChanged.emit()
+            self.connectionManuallyDisconnected.emit(connection_id)
 
     @Slot(str, str)
     def submitPassword(self, connection_id: str, password: str) -> None:
@@ -264,6 +454,43 @@ class NasManager(QObject):
     @Slot(result=bool)
     def isAnyNasRecordingActive(self) -> bool:
         return bool(self._active_recordings)
+
+    @Slot(str)
+    def registerRecoveryWatch(self, connection_id: str) -> None:
+        """Register a connection for auto-remount if it drops."""
+        if connection_id in self._connections:
+            self._recovery_watcher.watch(connection_id)
+
+    @Slot(str)
+    def unregisterRecoveryWatch(self, connection_id: str) -> None:
+        """Unregister a connection from auto-remount."""
+        self._recovery_watcher.unwatch(connection_id)
+
+    def connectionHost(self, connection_id: str) -> Optional[str]:
+        """Return the host for a connection, or None if unknown."""
+        conn = self._connections.get(connection_id)
+        if conn is None:
+            return None
+        return conn.host
+
+    def ensureRecordingPath(
+        self, connection_id: str, device_id: str
+    ) -> Optional[str]:
+        """Return a verified per-camera recording folder on a mounted NAS."""
+        if not self._is_mounted_and_healthy(connection_id):
+            return None
+
+        state = self._mount_states.get(connection_id)
+        if state is None:
+            return None
+
+        camera_folder = state.mount_point / self._camera_slug(device_id)
+        try:
+            camera_folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+
+        return str(camera_folder)
 
     # ------------------------------------------------------------------
     # Helpers

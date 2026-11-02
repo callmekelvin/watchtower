@@ -198,3 +198,45 @@ def test_set_purge_active_only_persists(storage_manager):
 
     storage_manager.setPurgeActiveOnly(False)
     assert storage_manager.purgeActiveOnly is False
+
+
+def test_unreachable_nas_reports_unavailable_not_zero(
+    storage_manager, monkeypatch
+):
+    monkeypatch.setattr(
+        "backend.storage_manager.is_likely_nas_mount", lambda _path: True
+    )
+    monkeypatch.setattr(
+        "backend.storage_manager.get_network_free_space_gb", lambda _path: None
+    )
+    monkeypatch.setattr(
+        "backend.storage_manager.is_nas_path_reachable", lambda _path: False
+    )
+    # Force the fallback path by making QStorageInfo look unreliable.
+    monkeypatch.setattr(
+        storage_manager, "_storage_info_unreliable", lambda _path: True
+    )
+
+    free_gb = storage_manager.free_space_gb_for_path("/tmp/watchtower/mounts/conn-1")
+    assert free_gb == float("inf")
+    assert storage_manager.storageStatusText == "NAS unavailable"
+
+
+def test_status_root_path_skips_unreachable_nas(
+    storage_manager, temp_folder, monkeypatch
+):
+    local_folder = temp_folder / "local"
+    local_folder.mkdir()
+
+    monkeypatch.setattr(
+        "backend.storage_manager.is_likely_nas_mount",
+        lambda path: path == "/tmp/watchtower/mounts/conn-1",
+    )
+    monkeypatch.setattr(
+        "backend.storage_manager.is_nas_path_reachable", lambda _path: False
+    )
+
+    storage_manager._active_folders = ["/tmp/watchtower/mounts/conn-1"]
+    storage_manager._managed_folders = {str(local_folder)}
+
+    assert storage_manager._status_root_path() == str(local_folder)

@@ -37,8 +37,9 @@ class CaptureSessionManager(QObject):
     _setWorkerVideoSink = Signal(str, QVideoSink)
     _clearWorkerVideoSink = Signal(str)
 
-    # Internal signals used to deliver recording commands to workers on their own threads. (Arg: device_id, Folder Path)
-    _startRecordingForWorker = Signal(str, str)
+    # Internal signals used to deliver recording commands to workers on their own threads.
+    # Args: device_id, folder_path, nas_host
+    _startRecordingForWorker = Signal(str, str, str)
     _stopRecordingForWorker = Signal(str)
 
     def __init__(
@@ -65,9 +66,18 @@ class CaptureSessionManager(QObject):
         self._recording_folders: Dict[str, str] = {}
         self._active_files: Dict[str, str] = {}
 
-        # NAS recordings: device_id -> connection_id for pending/active NAS mounts.
+        # NAS recordings:
+        #   pending -> device_id -> connection_id while a mount is in progress.
+        #   active  -> device_id -> connection_id currently recording.
+        #   desired -> device_id -> connection_id the user wants to record to
+        #             (survives an outage so we can auto-resume).
+        #   paused  -> device_id -> connection_id that has been paused due to outage.
         self._pending_nas_recordings: Dict[str, str] = {}
         self._active_nas_recordings: Dict[str, str] = {}
+        self._desired_nas_recordings: Dict[str, str] = {}
+        self._paused_nas_recordings: Dict[str, str] = {}
+        # connection_id -> count of desired/paused recordings using it.
+        self._nas_watch_refs: Dict[str, int] = {}
 
         # Set when storage is critical so no new segments are started.
         self._critical_stop_active: bool = False
@@ -80,6 +90,10 @@ class CaptureSessionManager(QObject):
         if self._nas_manager is not None:
             self._nas_manager.recordingPathReady.connect(self._on_nas_recording_path_ready)
             self._nas_manager.recordingMountFailed.connect(self._on_nas_recording_mount_failed)
+            self._nas_manager.connectionRestored.connect(self._on_nas_connection_restored)
+            self._nas_manager.connectionManuallyDisconnected.connect(
+                self._on_nas_connection_manually_disconnected
+            )
 
         # Start a capture worker for every camera that the device manager detects.
         self._device_manager.videoInputsChanged.connect(self._on_video_inputs_changed)
@@ -135,6 +149,12 @@ class CaptureSessionManager(QObject):
     @Slot()
     def stopAll(self) -> None:
         self._pending_nas_recordings.clear()
+        if self._nas_manager is not None:
+            for connection_id in list(self._nas_watch_refs.keys()):
+                self._nas_manager.unregisterRecoveryWatch(connection_id)
+        self._nas_watch_refs.clear()
+        self._desired_nas_recordings.clear()
+        self._paused_nas_recordings.clear()
         for device_id in list(self._workers.keys()):
             self._stop_session(device_id)
         self._set_current_device_id("")
@@ -154,7 +174,12 @@ class CaptureSessionManager(QObject):
         if self._nas_manager is None:
             self.errorOccurred.emit("NAS support is not available")
             return
-        if device_id in self._pending_nas_recordings or device_id in self._active_nas_recordings:
+        if (
+            device_id in self._pending_nas_recordings
+            or device_id in self._active_nas_recordings
+            or device_id in self._desired_nas_recordings
+            or device_id in self._paused_nas_recordings
+        ):
             return
         self._pending_nas_recordings[device_id] = connection_id
         self._nas_manager.mountForRecording(connection_id, device_id)
@@ -202,13 +227,26 @@ class CaptureSessionManager(QObject):
                 if self._nas_manager is not None:
                     self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, True)
             self._update_storage_manager()
-            self._startRecordingForWorker.emit(device_id, folder_path)
+
+            nas_host = ""
+            if nas_connection_id and self._nas_manager is not None:
+                nas_host = self._nas_manager.connectionHost(nas_connection_id) or ""
+
+            self._startRecordingForWorker.emit(device_id, folder_path, nas_host)
 
     # Stop recording the specified device.
     @Slot(str)
     def stopRecordingForDevice(self, device_id: str) -> None:
         if not device_id:
             return
+
+        # Cancel any NAS auto-recovery for this device.
+        self._pending_nas_recordings.pop(device_id, None)
+        self._paused_nas_recordings.pop(device_id, None)
+        desired_connection_id = self._desired_nas_recordings.pop(device_id, None)
+        if desired_connection_id is not None:
+            self._unregister_nas_watch(desired_connection_id)
+
         if device_id in self._workers:
             self._stopRecordingForWorker.emit(device_id)
 
@@ -227,6 +265,65 @@ class CaptureSessionManager(QObject):
         for device_id in list(self._recording_states.keys()):
             if self._recording_states.get(device_id, False):
                 self.stopRecordingForDevice(device_id)
+
+    # ------------------------------------------------------------------
+    # NAS recovery helpers
+    # ------------------------------------------------------------------
+    def _register_nas_watch(self, connection_id: str) -> None:
+        """Register a connection for auto-recovery (reference counted)."""
+        if not connection_id or self._nas_manager is None:
+            return
+        self._nas_watch_refs[connection_id] = self._nas_watch_refs.get(connection_id, 0) + 1
+        if self._nas_watch_refs[connection_id] == 1:
+            self._nas_manager.registerRecoveryWatch(connection_id)
+
+    def _unregister_nas_watch(self, connection_id: str) -> None:
+        """Unregister a connection from auto-recovery."""
+        if not connection_id or self._nas_manager is None:
+            return
+        count = self._nas_watch_refs.get(connection_id, 0)
+        if count <= 1:
+            self._nas_watch_refs.pop(connection_id, None)
+            self._nas_manager.unregisterRecoveryWatch(connection_id)
+        else:
+            self._nas_watch_refs[connection_id] = count - 1
+
+    def _on_nas_connection_restored(self, connection_id: str) -> None:
+        """Resume any paused recordings that use the restored connection."""
+        devices = [
+            device_id
+            for device_id, conn_id in self._paused_nas_recordings.items()
+            if conn_id == connection_id
+        ]
+        for device_id in devices:
+            if device_id not in self._workers:
+                self._paused_nas_recordings.pop(device_id, None)
+                self._desired_nas_recordings.pop(device_id, None)
+                continue
+
+            if self._nas_manager is None:
+                continue
+
+            local_path = self._nas_manager.ensureRecordingPath(connection_id, device_id)
+            if not local_path:
+                continue
+
+            self._paused_nas_recordings.pop(device_id, None)
+            self._begin_recording(device_id, local_path, nas_connection_id=connection_id)
+
+    def _on_nas_connection_manually_disconnected(self, connection_id: str) -> None:
+        """Cancel auto-recovery when the user manually disconnects a NAS."""
+        for device_id in list(self._desired_nas_recordings.keys()):
+            if self._desired_nas_recordings[device_id] == connection_id:
+                self._desired_nas_recordings.pop(device_id, None)
+                self._paused_nas_recordings.pop(device_id, None)
+                self._active_nas_recordings.pop(device_id, None)
+                self._recording_folders.pop(device_id, None)
+                self._active_files.pop(device_id, None)
+                if self._nas_manager is not None:
+                    self._nas_manager.setNasRecordingActive(device_id, connection_id, False)
+        self._nas_watch_refs.pop(connection_id, None)
+        self._update_storage_manager()
 
     # Push the current active folders/files to the storage manager
     def _update_storage_manager(self) -> None:
@@ -263,6 +360,7 @@ class CaptureSessionManager(QObject):
         self._startRecordingForWorker.connect(worker.startRecording)
         self._stopRecordingForWorker.connect(worker.stopRecording)
         worker.recordingStateChanged.connect(self._on_worker_recording_state_changed)
+        worker.recordingPaused.connect(self._on_worker_recording_paused, Qt.QueuedConnection)
         worker.segmentStarted.connect(self._on_segment_started, Qt.QueuedConnection)
         worker.segmentFinalized.connect(self._on_segment_finalized, Qt.QueuedConnection)
 
@@ -301,6 +399,10 @@ class CaptureSessionManager(QObject):
         nas_connection_id = self._active_nas_recordings.pop(device_id, None)
         if nas_connection_id and self._nas_manager is not None:
             self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, False)
+        self._desired_nas_recordings.pop(device_id, None)
+        paused_connection_id = self._paused_nas_recordings.pop(device_id, None)
+        if paused_connection_id is not None:
+            self._unregister_nas_watch(paused_connection_id)
         self._update_storage_manager()
 
         try:
@@ -327,6 +429,10 @@ class CaptureSessionManager(QObject):
         nas_connection_id = self._active_nas_recordings.pop(device_id, None)
         if nas_connection_id and self._nas_manager is not None:
             self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, False)
+        self._desired_nas_recordings.pop(device_id, None)
+        paused_connection_id = self._paused_nas_recordings.pop(device_id, None)
+        if paused_connection_id is not None:
+            self._unregister_nas_watch(paused_connection_id)
         self._update_storage_manager()
 
     # Worker Signal Functions
@@ -337,6 +443,23 @@ class CaptureSessionManager(QObject):
 
     def _on_worker_error(self, device_id: str, message: str) -> None:
         # Workers stay alive until application shutdown
+        self.errorOccurred.emit(message)
+
+    def _on_worker_recording_paused(self, device_id: str, message: str) -> None:
+        """Handle a recoverable NAS outage reported by a worker."""
+        connection_id = self._active_nas_recordings.get(device_id)
+        if connection_id is None:
+            connection_id = self._desired_nas_recordings.get(device_id)
+        if connection_id is None:
+            return
+
+        self._active_nas_recordings.pop(device_id, None)
+        self._paused_nas_recordings[device_id] = connection_id
+        self._recording_folders.pop(device_id, None)
+        self._active_files.pop(device_id, None)
+        if self._nas_manager is not None:
+            self._nas_manager.setNasRecordingActive(device_id, connection_id, False)
+        self._update_storage_manager()
         self.errorOccurred.emit(message)
 
     def _on_worker_stopped(self, device_id: str) -> None:
@@ -351,6 +474,10 @@ class CaptureSessionManager(QObject):
         nas_connection_id = self._active_nas_recordings.pop(device_id, None)
         if nas_connection_id and self._nas_manager is not None:
             self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, False)
+        self._desired_nas_recordings.pop(device_id, None)
+        paused_connection_id = self._paused_nas_recordings.pop(device_id, None)
+        if paused_connection_id is not None:
+            self._unregister_nas_watch(paused_connection_id)
         self._update_storage_manager()
         if self.anyRecordingActive != old_any_active:
             self.anyRecordingActiveChanged.emit()
@@ -374,6 +501,8 @@ class CaptureSessionManager(QObject):
         connection_id = self._pending_nas_recordings.pop(device_id, None)
         if connection_id is None:
             return
+        self._desired_nas_recordings[device_id] = connection_id
+        self._register_nas_watch(connection_id)
         self._begin_recording(device_id, local_path, nas_connection_id=connection_id)
 
     def _on_nas_recording_mount_failed(self, device_id: str, message: str) -> None:

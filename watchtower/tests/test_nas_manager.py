@@ -15,6 +15,11 @@ def nas_manager(qtbot, ini_settings, monkeypatch, tmp_path):
     )
     mgr = NasManager()
     yield mgr
+    mgr._recovery_watcher.unwatch_all()
+    for thread in list(mgr._recovery_threads.values()):
+        if thread.isRunning():
+            thread.quit()
+            thread.wait(2000)
 
 
 def test_save_connection_adds_and_persists(nas_manager, qtbot):
@@ -254,3 +259,152 @@ def test_mount_for_recording_nfs_does_not_prompt_for_password(nas_manager, qtbot
         nas_manager.mountForRecording(conn_id, "cam-1")
 
     assert blocker.args[0] == "cam-1"
+
+
+def test_register_recovery_watch_starts_watcher(nas_manager):
+    nas_manager.saveConnection({
+        "name": "NFS NAS",
+        "protocol": "nfs",
+        "host": "nas",
+        "share": "export",
+    })
+    conn_id = nas_manager.connections[0]["id"]
+
+    nas_manager.registerRecoveryWatch(conn_id)
+    assert conn_id in nas_manager._recovery_watcher._watched
+    assert nas_manager._recovery_watcher._timer.isActive()
+
+
+def test_recovery_watcher_tick_attempts_remount(nas_manager):
+    nas_manager.saveConnection({
+        "name": "NFS NAS",
+        "protocol": "nfs",
+        "host": "nas",
+        "share": "export",
+    })
+    conn_id = nas_manager.connections[0]["id"]
+
+    attempted = []
+    nas_manager._recovery_watcher._attempt_remount = lambda cid: attempted.append(cid)
+
+    nas_manager.registerRecoveryWatch(conn_id)
+    nas_manager._recovery_watcher._on_tick()
+
+    assert attempted == [conn_id]
+
+
+def test_recovery_mount_worker_emits_finished(qtbot, monkeypatch, tmp_path):
+    from backend.nas_manager import NasMountWorker
+
+    conn = NasConnection(
+        name="Test", protocol="nfs", host="nas", share="export"
+    )
+
+    def fake_mount(conn, mount_point, password, drive_letter):
+        mount_point.mkdir(parents=True, exist_ok=True)
+        return True, None, None
+
+    monkeypatch.setattr("backend.nas_manager.mount_share", fake_mount)
+    monkeypatch.setattr("backend.nas_manager.probe_nas_write", lambda _mp: (True, None))
+
+    worker = NasMountWorker(conn)
+    with qtbot.waitSignal(worker.finished, timeout=1000) as blocker:
+        worker.perform_mount()
+
+    assert blocker.args[0] == conn.id
+    assert blocker.args[1] is True
+
+
+def test_recovery_mount_worker_emits_failed_on_bad_mount(qtbot, monkeypatch, tmp_path):
+    from backend.nas_manager import NasMountWorker
+
+    conn = NasConnection(
+        name="Test", protocol="nfs", host="nas", share="export"
+    )
+
+    monkeypatch.setattr(
+        "backend.nas_manager.mount_share",
+        lambda *args, **kwargs: (False, None, "host unreachable"),
+    )
+
+    worker = NasMountWorker(conn)
+    with qtbot.waitSignal(worker.finished, timeout=1000) as blocker:
+        worker.perform_mount()
+
+    assert blocker.args[0] == conn.id
+    assert blocker.args[1] is False
+    assert "host unreachable" in blocker.args[2]
+
+
+def test_on_mount_finished_restores_connection(nas_manager, qtbot, monkeypatch, tmp_path):
+    nas_manager.saveConnection({
+        "name": "NFS NAS",
+        "protocol": "nfs",
+        "host": "nas",
+        "share": "export",
+    })
+    conn_id = nas_manager.connections[0]["id"]
+
+    mount_point = tmp_path / "mount"
+    mount_point.mkdir(parents=True, exist_ok=True)
+
+    with qtbot.waitSignal(nas_manager.connectionRestored, timeout=1000) as blocker:
+        nas_manager._recovery_watcher._on_mount_finished(
+            conn_id, True, "", str(mount_point), ""
+        )
+
+    assert blocker.args[0] == conn_id
+    assert nas_manager.isConnectionMounted(conn_id) is True
+
+
+def test_manual_disconnect_unwatches_connection(nas_manager, monkeypatch):
+    nas_manager.saveConnection({
+        "name": "NFS NAS",
+        "protocol": "nfs",
+        "host": "nas",
+        "share": "export",
+    })
+    conn_id = nas_manager.connections[0]["id"]
+
+    monkeypatch.setattr(
+        "backend.nas_manager.unmount_share",
+        lambda *args, **kwargs: (True, None),
+    )
+
+    nas_manager.registerRecoveryWatch(conn_id)
+    nas_manager.requestDisconnect(conn_id)
+
+    assert conn_id not in nas_manager._recovery_watcher._watched
+
+
+def test_ensure_recording_path_returns_folder_when_mounted(nas_manager, qtbot, monkeypatch):
+    nas_manager.saveConnection({
+        "name": "NFS NAS",
+        "protocol": "nfs",
+        "host": "nas",
+        "share": "export",
+    })
+    conn_id = nas_manager.connections[0]["id"]
+
+    def fake_mount(conn, mount_point, password, drive_letter):
+        mount_point.mkdir(parents=True, exist_ok=True)
+        return True, None, None
+
+    monkeypatch.setattr("backend.nas_manager.mount_share", fake_mount)
+
+    nas_manager.requestConnect(conn_id)
+    path = nas_manager.ensureRecordingPath(conn_id, "cam-1")
+    assert path is not None
+    assert "cam-1" in path
+
+
+def test_ensure_recording_path_returns_none_when_not_mounted(nas_manager):
+    nas_manager.saveConnection({
+        "name": "NFS NAS",
+        "protocol": "nfs",
+        "host": "nas",
+        "share": "export",
+    })
+    conn_id = nas_manager.connections[0]["id"]
+
+    assert nas_manager.ensureRecordingPath(conn_id, "cam-1") is None

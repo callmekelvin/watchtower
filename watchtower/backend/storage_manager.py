@@ -4,7 +4,11 @@ from typing import List, Set
 from PySide6.QtCore import QObject, QDir, QSettings, QStorageInfo, QThread, Signal, Slot, Property, QTimer
 
 from backend.storage_purge_worker import StoragePurgeWorker
-from backend.nas_mount_helper import get_network_free_space_gb, is_likely_nas_mount
+from backend.nas_mount_helper import (
+    get_network_free_space_gb,
+    is_likely_nas_mount,
+    is_nas_path_reachable,
+)
 
 
 class StorageManager(QObject):
@@ -307,9 +311,17 @@ class StorageManager(QObject):
     # Resolve Root Path
     def _status_root_path(self) -> str:
         for folder in self._active_folders:
+            if is_likely_nas_mount(folder):
+                if is_nas_path_reachable(folder):
+                    return folder
+                continue
             if os.path.isdir(folder):
                 return folder
         for folder in sorted(self._managed_folders):
+            if is_likely_nas_mount(folder):
+                if is_nas_path_reachable(folder):
+                    return folder
+                continue
             if os.path.isdir(folder):
                 return folder
         home = QDir.homePath()
@@ -335,6 +347,10 @@ class StorageManager(QObject):
             fallback = get_network_free_space_gb(path)
             if fallback is not None:
                 return fallback
+            # If the NAS is unreachable, report "unavailable" rather than 0 GB,
+            # which would trigger a false low-space alarm.
+            if not is_nas_path_reachable(path):
+                return float("inf")
         return available / (1024 ** 3)
 
     def _storage_info_unreliable(self, path: str) -> bool:
@@ -365,9 +381,12 @@ class StorageManager(QObject):
 
     # Format Storage information from Bytes to GB as String
     def _status_text(self) -> str:
-        info = self._storage_info(self._status_root_path())
-        free_gb = self._free_space_gb(self._status_root_path())
+        root_path = self._status_root_path()
+        info = self._storage_info(root_path)
+        free_gb = self._free_space_gb(root_path)
         total_gb = info.bytesTotal() / (1024 ** 3)
+        if free_gb == float("inf"):
+            return "NAS unavailable"
         if total_gb <= 0:
             return f"{free_gb:.2f} GB free"
         used_gb = total_gb - free_gb

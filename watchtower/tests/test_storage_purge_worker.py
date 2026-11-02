@@ -246,3 +246,34 @@ def test_purge_uses_network_free_space_fallback_for_nas_mount(
         [str(temp_folder)], set(), 0, 86400, str(temp_folder)
     )
     assert str(old) in deleted
+
+
+def test_purge_skips_unreachable_nas_folder(
+    mock_storage_info, temp_folder, monkeypatch, qtbot
+):
+    """Unreachable NAS folders must be skipped rather than raising errors."""
+    mock_storage_info(-1)
+
+    local = temp_folder / "local"
+    local.mkdir()
+    old_local = make_recording(local, "cam_20230101_120000_000.mp4")
+
+    monkeypatch.setattr(
+        "backend.storage_purge_worker.is_likely_nas_mount",
+        lambda path: path == "/tmp/watchtower/mounts/conn-1",
+    )
+    monkeypatch.setattr(
+        "backend.storage_purge_worker.is_nas_path_reachable", lambda _path: False
+    )
+
+    worker = StoragePurgeWorker()
+    deleted = worker._purge(
+        ["/tmp/watchtower/mounts/conn-1", str(local)],
+        set(),
+        0,
+        86400,
+        str(local),
+    )
+
+    assert "/tmp/watchtower/mounts/conn-1" not in deleted
+    assert str(old_local) in deleted

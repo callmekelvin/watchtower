@@ -1,12 +1,13 @@
 import os
 import re
 from datetime import datetime, timezone
+from typing import Optional
 
 from PySide6.QtCore import QObject, Signal, Slot, QUrl, QTimer, QDateTime
 from PySide6.QtMultimedia import QCamera, QCameraDevice, QMediaCaptureSession, QMediaDevices, QMediaFormat, QMediaMetaData, QMediaRecorder, QVideoSink
 
 from backend.device_worker import _decode_id
-from backend.nas_mount_helper import is_likely_nas_mount
+from backend.nas_mount_helper import check_host_port, is_likely_nas_mount
 
 
 # Create a filesystem-safe lower-case slug from a device description.
@@ -30,6 +31,10 @@ class CaptureSessionWorker(QObject):
     # Args: device_id, message
     fatalErrorOccurred = Signal(str, str)
 
+    # Signal emitted when a NAS destination becomes unreachable and recording
+    # is paused pending auto-recovery. Args: device_id, message
+    recordingPaused = Signal(str, str)
+
     # Signal emitted after stop() has finished cleaning up (Arg: Device ID)
     stopped = Signal(str)
 
@@ -44,6 +49,9 @@ class CaptureSessionWorker(QObject):
 
     # Hardcoded segment duration: 15 minutes in milliseconds.
     _SEGMENT_DURATION_MS = 15 * 60 * 1000
+
+    # Default TCP port used for the NFS liveness check.
+    _DEFAULT_NAS_PORT = 2049
 
     def __init__(self, device_id: str, parent: QObject | None = None):
         super().__init__(parent)
@@ -68,6 +76,11 @@ class CaptureSessionWorker(QObject):
         self._active_output_path: str | None = None
         self._stop_requested: bool = False
         self._segment_start_failed: bool = False
+
+        # NAS-specific state used for the TCP liveness check and pause/resume.
+        self._nas_host: Optional[str] = None
+        self._nas_port: int = self._DEFAULT_NAS_PORT
+        self._nas_paused: bool = False
 
     # Function - Called from Capture Session Manager Main Thread to
     @Slot(str, QVideoSink)
@@ -199,8 +212,10 @@ class CaptureSessionWorker(QObject):
         if self._is_recording == is_recording:
             return
         self._is_recording = is_recording
-        if is_recording and self._output_folder and is_likely_nas_mount(self._output_folder):
-            self._nas_health_timer.start(5000)
+        if is_recording:
+            self._nas_paused = False
+            if self._output_folder and is_likely_nas_mount(self._output_folder):
+                self._nas_health_timer.start(5000)
         else:
             self._nas_health_timer.stop()
         self.recordingStateChanged.emit(self._device_id, self._is_recording)
@@ -210,20 +225,39 @@ class CaptureSessionWorker(QObject):
             return
         if not is_likely_nas_mount(self._output_folder):
             return
-        if os.path.isdir(self._output_folder) and os.access(self._output_folder, os.W_OK):
+        if self._nas_host and check_host_port(self._nas_host, self._nas_port, timeout=2.0):
             return
-        self.errorOccurred.emit(
-            self._device_id,
-            f"NAS destination '{self._output_folder}' is unreachable; stopping recording",
+        self._pause_for_nas_failure(
+            f"NAS destination '{self._output_folder}' is unreachable; recording paused"
         )
+
+    def _pause_for_nas_failure(self, message: str) -> None:
+        """Pause recording due to a NAS failure without terminating the app."""
+        if self._nas_paused:
+            return
+        self._nas_paused = True
+        self.errorOccurred.emit(self._device_id, message)
+        self.recordingPaused.emit(self._device_id, message)
         self._nas_health_timer.stop()
         self._stop_requested = True
         self._segment_timer.stop()
         try:
-            if self._recorder is not None and self._recorder.recorderState() == QMediaRecorder.RecorderState.RecordingState:
+            if (
+                self._recorder is not None
+                and self._recorder.recorderState()
+                == QMediaRecorder.RecorderState.RecordingState
+            ):
                 self._recorder.stop()
         except Exception as exc:
-            self.errorOccurred.emit(self._device_id, f"Failed to stop recording after NAS failure: {exc}")
+            self.errorOccurred.emit(
+                self._device_id, f"Failed to stop recording after NAS failure: {exc}"
+            )
+
+    def _is_nas_output_reachable(self) -> bool:
+        """Return True if the configured NAS host is reachable."""
+        if not self._nas_host:
+            return False
+        return check_host_port(self._nas_host, self._nas_port, timeout=2.0)
 
     def _generate_output_path(self, folder_path: str) -> str:
         name = _sanitize_filename(self._camera_device.description()) if self._camera_device else "camera"
@@ -248,6 +282,11 @@ class CaptureSessionWorker(QObject):
     def _start_segment(self) -> bool:
         if self._recorder is None or self._output_folder is None:
             return False
+        if is_likely_nas_mount(self._output_folder) and not self._is_nas_output_reachable():
+            self._pause_for_nas_failure(
+                f"NAS host unreachable; cannot start segment for {self._device_id}"
+            )
+            return False
         if not self._ensure_output_folder(self._output_folder):
             return False
         output_path = self._generate_output_path(self._output_folder)
@@ -264,6 +303,17 @@ class CaptureSessionWorker(QObject):
     def _start_next_segment(self) -> None:
         old_path = self._active_output_path
         if not self._start_segment():
+            # NAS failures are recoverable; do not terminate the application.
+            if (
+                self._output_folder
+                and is_likely_nas_mount(self._output_folder)
+                and not self._is_nas_output_reachable()
+            ):
+                self._pause_for_nas_failure(
+                    f"NAS host unreachable; cannot rotate segment for {self._device_id}"
+                )
+                return
+
             self.errorOccurred.emit(
                 self._device_id, "Failed to rotate to next segment; recording stopped"
             )
@@ -283,8 +333,10 @@ class CaptureSessionWorker(QObject):
         self._recorder.stop()
 
     # Start recording video to the provided folder.
-    @Slot(str, str)
-    def startRecording(self, device_id: str, folder_path: str) -> None:
+    @Slot(str, str, str)
+    def startRecording(
+        self, device_id: str, folder_path: str, nas_host: str = ""
+    ) -> None:
         if device_id != self._device_id:
             return
         try:
@@ -307,8 +359,21 @@ class CaptureSessionWorker(QObject):
 
             self._stop_requested = False
             self._output_folder = local_path
+            self._nas_host = nas_host.strip() or None
+            self._nas_paused = False
 
             if not self._start_segment():
+                # NAS failures are recoverable; do not terminate the application.
+                if (
+                    is_likely_nas_mount(local_path)
+                    and self._nas_host
+                    and not self._is_nas_output_reachable()
+                ):
+                    self._pause_for_nas_failure(
+                        f"NAS host unreachable; recording paused for {self._device_id}"
+                    )
+                    return
+
                 self._set_recording(False)
                 self.fatalErrorOccurred.emit(
                     self._device_id,
@@ -374,6 +439,8 @@ class CaptureSessionWorker(QObject):
             self._camera_device = None
             self._output_folder = None
             self._active_output_path = None
+            self._nas_host = None
+            self._nas_paused = False
             self._set_recording(False)
         except Exception as exc:
             # Notify Capture Session Manager Thread of termination error

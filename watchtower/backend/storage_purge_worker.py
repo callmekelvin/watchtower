@@ -5,7 +5,11 @@ from typing import List, Set, Tuple
 
 from PySide6.QtCore import QObject, QStorageInfo, QTimer, Signal, Slot
 
-from backend.nas_mount_helper import get_network_free_space_gb, is_likely_nas_mount
+from backend.nas_mount_helper import (
+    get_network_free_space_gb,
+    is_likely_nas_mount,
+    is_nas_path_reachable,
+)
 
 
 # Recording filename regex pattern produced by CaptureSessionWorker:
@@ -125,9 +129,15 @@ class StoragePurgeWorker(QObject):
 
         # Collect eligible finalized .mp4 files from list of folders to scan
         candidates: List[Tuple[datetime, str, int]] = []
+        reachable_folders = 0
         for folder in folders_to_scan:
-            if not os.path.isdir(folder):
+            if is_likely_nas_mount(folder):
+                if not is_nas_path_reachable(folder):
+                    continue
+            elif not os.path.isdir(folder):
                 continue
+
+            reachable_folders += 1
             try:
                 for entry in os.scandir(folder):
                     if not entry.is_file():
@@ -148,6 +158,10 @@ class StoragePurgeWorker(QObject):
                     candidates.append((file_time, file_path, file_size))
             except OSError as exc:
                 self.purgeFailed.emit(f"Failed to scan '{folder}': {exc}")
+
+        if not reachable_folders:
+            self.purgeFailed.emit("No reachable folders to purge")
+            return []
 
         # Purge Candidate Video Files by Oldest first
         candidates.sort(key=lambda item: item[0])
