@@ -30,6 +30,16 @@ class NasConnection(BaseModel):
     mount_options: Optional[str] = None
     enabled: bool = True
 
+    @field_validator("id")
+    @classmethod
+    def _validate_or_generate_id(cls, value: str) -> str:
+        """Treat missing/empty ids as a request for a new UUID."""
+        if isinstance(value, str):
+            value = value.strip()
+        if not value:
+            return str(uuid.uuid4())
+        return value
+
     @field_validator("host")
     @classmethod
     def _validate_host(cls, value: str) -> str:

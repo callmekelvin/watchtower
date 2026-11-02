@@ -1,6 +1,7 @@
 import json
 import platform
 import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -337,6 +338,10 @@ class NasManager(QObject):
         try:
             # QML may pass a QJSValue; convert it to a plain Python dict.
             py_data = dict(data)
+            # New connections come in with an empty id from QML. Ensure we
+            # always store a real UUID so the mount point is a sub-directory.
+            if not str(py_data.get("id", "")).strip():
+                py_data["id"] = str(uuid.uuid4())
             conn = NasConnection.from_dict(py_data)
         except Exception as exc:
             self.errorOccurred.emit(f"Invalid NAS connection: {exc}")
@@ -442,6 +447,9 @@ class NasManager(QObject):
         previous_state: Optional[_MountState] = None,
     ) -> None:
         """Queue a mount operation on a background thread."""
+        if not str(connection_id).strip():
+            return
+
         conn = self._connections.get(connection_id)
         if conn is None:
             return

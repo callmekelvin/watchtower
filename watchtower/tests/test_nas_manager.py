@@ -224,6 +224,41 @@ def test_request_connect_unknown_connection_emits_error(nas_manager, qtbot):
     assert "Unknown NAS connection" in blocker.args[0]
 
 
+def test_save_connection_generates_id_for_empty_id(nas_manager):
+    nas_manager.saveConnection({
+        "id": "",
+        "name": "New NAS",
+        "protocol": "nfs",
+        "host": "nas",
+        "share": "export",
+    })
+
+    assert len(nas_manager.connections) == 1
+    conn_id = nas_manager.connections[0]["id"]
+    assert conn_id
+    assert len(conn_id) > 10  # UUID-like
+
+
+def test_save_connection_preserves_existing_id(nas_manager):
+    nas_manager.saveConnection({
+        "id": "my-custom-id",
+        "name": "Existing NAS",
+        "protocol": "nfs",
+        "host": "nas",
+        "share": "export",
+    })
+
+    assert nas_manager.connections[0]["id"] == "my-custom-id"
+
+
+def test_mount_for_recording_empty_connection_id_fails(nas_manager, qtbot):
+    with qtbot.waitSignal(nas_manager.recordingMountFailed, timeout=1000) as blocker:
+        nas_manager.mountForRecording("", "cam-1")
+
+    assert blocker.args[0] == "cam-1"
+    assert "Unknown NAS connection" in blocker.args[1]
+
+
 def test_request_connect_nfs_does_not_prompt_for_password(nas_manager, qtbot, monkeypatch):
     nas_manager.saveConnection({
         "name": "NFS NAS",

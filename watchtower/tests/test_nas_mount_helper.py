@@ -62,6 +62,28 @@ def test_sanitize_mount_point_rejects_outside_app_data(monkeypatch, tmp_path):
         sanitize_mount_point("/tmp/mounts/conn-1", "conn-1")
 
 
+def test_sanitize_mount_point_rejects_mounts_root(monkeypatch, tmp_path):
+    app_dir = tmp_path / "Watchtower"
+    mounts_root = app_dir / "mounts"
+    mounts_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        "backend.nas_mount_helper.get_app_data_dir", lambda: app_dir
+    )
+    with pytest.raises(ValueError):
+        sanitize_mount_point(str(mounts_root), "conn-1")
+
+
+def test_sanitize_mount_point_accepts_sub_directory(monkeypatch, tmp_path):
+    app_dir = tmp_path / "Watchtower"
+    mounts_root = app_dir / "mounts"
+    mounts_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        "backend.nas_mount_helper.get_app_data_dir", lambda: app_dir
+    )
+    point = sanitize_mount_point(str(mounts_root / "conn-1"), "conn-1")
+    assert point == mounts_root / "conn-1"
+
+
 def test_default_mount_point_under_app_data(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "backend.nas_mount_helper.get_app_data_dir", lambda: tmp_path / "Watchtower"

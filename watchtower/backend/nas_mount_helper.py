@@ -73,11 +73,17 @@ def sanitize_mount_point(path: Optional[str], connection_id: str) -> Path:
 
     expected_root = (get_app_data_dir() / "mounts").resolve()
     try:
-        mount_point.relative_to(expected_root)
+        relative = mount_point.relative_to(expected_root)
     except ValueError as exc:
         raise ValueError(
             f"Mount point must be under {expected_root}: {mount_point}"
         ) from exc
+
+    if str(relative) == "." or relative == Path("."):
+        raise ValueError(
+            f"Mount point cannot be the managed mounts root: {mount_point}"
+        )
+
     return mount_point
 
 
