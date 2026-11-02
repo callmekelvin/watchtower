@@ -58,14 +58,15 @@ Popup {
         if (editName.trim() === "" || editHost.trim() === "" || editShare.trim() === "") {
             return;
         }
+        var isNfs = editProtocol === "nfs";
         bridge.saveNasConnection({
             id: editingId,
             name: editName.trim(),
             protocol: editProtocol,
             host: editHost.trim(),
             share: editShare.trim(),
-            username: editUsername.trim() || null,
-            domain: editDomain.trim() || null,
+            username: isNfs ? null : (editUsername.trim() || null),
+            domain: isNfs ? null : (editDomain.trim() || null),
             mount_options: editMountOptions.trim() || null,
             enabled: true
         });
@@ -208,20 +209,28 @@ Popup {
                 onTextChanged: root.editShare = text
             }
 
-            Label { text: "Username:" }
+            Label {
+                text: "Username:"
+                visible: root.editProtocol !== "nfs"
+            }
             TextField {
                 id: userField
                 Layout.fillWidth: true
                 text: root.editUsername
                 onTextChanged: root.editUsername = text
+                visible: root.editProtocol !== "nfs"
             }
 
-            Label { text: "Domain:" }
+            Label {
+                text: "Domain:"
+                visible: root.editProtocol !== "nfs"
+            }
             TextField {
                 id: domainField
                 Layout.fillWidth: true
                 text: root.editDomain
                 onTextChanged: root.editDomain = text
+                visible: root.editProtocol !== "nfs"
             }
 
             Label { text: "Mount options:" }

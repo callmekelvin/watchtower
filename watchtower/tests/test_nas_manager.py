@@ -212,3 +212,45 @@ def test_request_connect_unknown_connection_emits_error(nas_manager, qtbot):
     with qtbot.waitSignal(nas_manager.errorOccurred) as blocker:
         nas_manager.requestConnect("does-not-exist")
     assert "Unknown NAS connection" in blocker.args[0]
+
+
+def test_request_connect_nfs_does_not_prompt_for_password(nas_manager, qtbot, monkeypatch):
+    nas_manager.saveConnection({
+        "name": "NFS NAS",
+        "protocol": "nfs",
+        "host": "nas",
+        "share": "export",
+    })
+    conn_id = nas_manager.connections[0]["id"]
+
+    def fake_mount(conn, mount_point, password, drive_letter):
+        mount_point.mkdir(parents=True, exist_ok=True)
+        return True, None, None
+
+    monkeypatch.setattr("backend.nas_manager.mount_share", fake_mount)
+
+    with qtbot.waitSignal(nas_manager.connectionStatusChanged):
+        nas_manager.requestConnect(conn_id)
+
+    assert nas_manager.isConnectionMounted(conn_id) is True
+
+
+def test_mount_for_recording_nfs_does_not_prompt_for_password(nas_manager, qtbot, monkeypatch):
+    nas_manager.saveConnection({
+        "name": "NFS NAS",
+        "protocol": "nfs",
+        "host": "nas",
+        "share": "export",
+    })
+    conn_id = nas_manager.connections[0]["id"]
+
+    def fake_mount(conn, mount_point, password, drive_letter):
+        mount_point.mkdir(parents=True, exist_ok=True)
+        return True, None, None
+
+    monkeypatch.setattr("backend.nas_manager.mount_share", fake_mount)
+
+    with qtbot.waitSignal(nas_manager.recordingPathReady) as blocker:
+        nas_manager.mountForRecording(conn_id, "cam-1")
+
+    assert blocker.args[0] == "cam-1"

@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QObject, QSettings, Signal, Slot, Property
 
-from backend.nas_connection import NasConnection
+from backend.nas_connection import NasConnection, NasProtocol
 from backend.nas_mount_helper import (
     find_available_drive_letter,
     get_default_mount_point,
@@ -130,6 +130,10 @@ class NasManager(QObject):
             self.connectionStatusChanged.emit()
             return
 
+        if conn.protocol == NasProtocol.NFS:
+            self._perform_mount(connection_id, "", "connect")
+            return
+
         self._pending_password_for = connection_id
         self._pending_operation = "connect"
         self._prompt_for_password(conn)
@@ -162,13 +166,19 @@ class NasManager(QObject):
         if self._pending_password_for != connection_id:
             return
 
-        conn = self._connections.get(connection_id)
-        if conn is None:
-            return
-
         self._pending_password_for = None
         operation = self._pending_operation
         self._pending_operation = None
+
+        self._perform_mount(connection_id, password, operation)
+
+    def _perform_mount(
+        self, connection_id: str, password: str, operation: Optional[str]
+    ) -> None:
+        """Execute a mount for the given connection and dispatch results."""
+        conn = self._connections.get(connection_id)
+        if conn is None:
+            return
 
         mount_point = get_default_mount_point(connection_id)
         drive_letter = (
@@ -218,6 +228,10 @@ class NasManager(QObject):
 
         if self._is_mounted_and_healthy(connection_id):
             self._prepare_recording_path(device_id, connection_id)
+            return
+
+        if conn.protocol == NasProtocol.NFS:
+            self._perform_mount(connection_id, "", f"record:{device_id}")
             return
 
         self._pending_password_for = connection_id
