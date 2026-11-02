@@ -24,6 +24,7 @@ def main():
     # Qt Multimedia's FFmpeg backend on Linux auto-selects VAAPI for H.264 encoding
     if platform.system() == "Linux":
         os.environ.setdefault("QT_FFMPEG_ENCODING_HW_DEVICE_TYPES", "")
+        os.environ.setdefault("QT_FFMPEG_CAPTURE_HW_DEVICE_TYPES", "")
 
     # Create QT UI Application
     app = QGuiApplication(sys.argv)
