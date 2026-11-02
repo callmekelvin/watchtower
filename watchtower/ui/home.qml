@@ -30,6 +30,11 @@ ApplicationWindow {
                 onClicked: storageSettingsPopup.open()
             }
 
+            Button {
+                text: "NAS Settings"
+                onClicked: nasSettingsPopup.open()
+            }
+
             Label {
                 id: lastRefreshLabel
                 text: bridge && bridge.lastRefreshTime ? "Last refreshed: " + bridge.lastRefreshTime : ""
@@ -105,6 +110,16 @@ ApplicationWindow {
         id: storageSettingsPopup
     }
 
+    // Open NAS Settings Dialog
+    NasSettingsPopup {
+        id: nasSettingsPopup
+    }
+
+    // Password prompt for NAS connections
+    PasswordDialog {
+        id: passwordDialog
+    }
+
     Connections {
         target: bridge
         function onErrorOccurred(message) {
@@ -112,6 +127,9 @@ ApplicationWindow {
         }
         function onStorageCritical(message) {
             errorLabel.text = "STORAGE CRITICAL: " + message;
+        }
+        function onNasPasswordPromptRequested(connectionId, title, message) {
+            passwordDialog.openPrompt(connectionId, title, message);
         }
     }
 

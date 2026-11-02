@@ -5,3 +5,5 @@ CameraDeviceItem camera_device_item.qml
 CameraCapture camera_capture.qml
 RecordingPopup recording_popup.qml
 StorageSettingsPopup storage_settings_popup.qml
+NasSettingsPopup nas_settings_popup.qml
+PasswordDialog password_dialog.qml

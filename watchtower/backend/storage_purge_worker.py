@@ -5,6 +5,8 @@ from typing import List, Set, Tuple
 
 from PySide6.QtCore import QObject, QStorageInfo, QTimer, Signal, Slot
 
+from backend.nas_mount_helper import get_network_free_space_gb, is_likely_nas_mount
+
 
 # Recording filename regex pattern produced by CaptureSessionWorker:
 #   {camera}_{YYYYMMDD}_{HHMMSS}_{mmm}.mp4
@@ -113,9 +115,8 @@ class StoragePurgeWorker(QObject):
         protected_files = {os.path.normpath(p) for p in protected_files}
 
         # Get Storage Information
-        storage = QStorageInfo(root_path) if root_path else QStorageInfo()
-        free_bytes = storage.bytesAvailable()
-        if free_bytes < 0:
+        free_bytes = self._free_bytes_for_path(root_path)
+        if free_bytes is None:
             self.purgeFailed.emit(f"Cannot determine free space for '{root_path}'; aborting purge")
             return []
 
@@ -152,12 +153,13 @@ class StoragePurgeWorker(QObject):
         candidates.sort(key=lambda item: item[0])
 
         deleted: List[str] = []
+        delete_errors: List[str] = []
 
         # First pass: enforce retention age regardless of free space.
         still_eligible: List[Tuple[datetime, str, int]] = []
         for file_time, file_path, file_size in candidates:
             if file_time.timestamp() <= retention_cutoff_ts:
-                if self._delete_file(file_path):
+                if self._delete_file(file_path, delete_errors):
                     deleted.append(file_path)
                     free_bytes += file_size
             else:
@@ -167,17 +169,47 @@ class StoragePurgeWorker(QObject):
         for file_time, file_path, file_size in still_eligible:
             if free_bytes >= min_free_bytes:
                 break
-            if self._delete_file(file_path):
+            if self._delete_file(file_path, delete_errors):
                 deleted.append(file_path)
                 free_bytes += file_size
 
+        if delete_errors:
+            self.purgeFailed.emit(
+                "Some files could not be deleted: " + "; ".join(delete_errors[:5])
+            )
         return deleted
 
+    def _free_bytes_for_path(self, path: str) -> Optional[int]:
+        """Return free bytes for ``path``, with a NAS fallback when needed."""
+        storage = QStorageInfo(path) if path else QStorageInfo()
+        free_bytes = storage.bytesAvailable()
+        total_bytes = storage.bytesTotal()
+
+        # bytesAvailable < 0 means QStorageInfo could not determine free space.
+        free_unknown = free_bytes < 0
+        if free_unknown:
+            free_bytes = 0
+
+        # For local volumes a known positive value is trustworthy.
+        if not free_unknown and free_bytes > 0 and not is_likely_nas_mount(path):
+            return free_bytes
+
+        # For NAS mounts QStorageInfo may be unreliable.  Try a platform command.
+        if is_likely_nas_mount(path) and (free_unknown or free_bytes <= 0 or total_bytes <= 0):
+            fallback_gb = get_network_free_space_gb(path)
+            if fallback_gb is not None:
+                return int(fallback_gb * (1024 ** 3))
+
+        # QStorageInfo truly could not resolve the volume.
+        if free_unknown and total_bytes <= 0:
+            return None
+        return free_bytes
+
     # Delete the File
-    def _delete_file(self, file_path: str) -> bool:
+    def _delete_file(self, file_path: str, error_log: List[str]) -> bool:
         try:
             os.remove(file_path)
             return True
         except OSError as exc:
-            self.purgeFailed.emit(f"Failed to delete '{file_path}': {exc}")
+            error_log.append(f"'{file_path}': {exc}")
             return False

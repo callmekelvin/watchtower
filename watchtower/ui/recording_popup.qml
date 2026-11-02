@@ -3,7 +3,8 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Dialogs
 
-// Modal popup used to choose an output folder before starting a recording
+// Modal popup used to choose an output destination before starting a recording.
+// The user may select either a local folder or a configured NAS connection.
 Popup {
     id: root
 
@@ -11,6 +12,7 @@ Popup {
     property string deviceDescription: ""
 
     signal startRecording(string folderPath)
+    signal startRecordingToNas(string connectionId)
 
     modal: true
     focus: true
@@ -19,9 +21,15 @@ Popup {
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
     anchors.centerIn: parent
-    width: 420
-    height: 240
+    width: 460
+    height: 360
     padding: 20
+
+    onOpened: {
+        destinationTabs.currentIndex = 0;
+        folderDialog.selectedFolder = "";
+        nasConnectionBox.currentIndex = 0;
+    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -41,23 +49,85 @@ Popup {
             visible: text !== ""
         }
 
-        RowLayout {
+        TabBar {
+            id: destinationTabs
             Layout.fillWidth: true
-            spacing: 8
 
-            Button {
-                text: "Select Folder"
-                onClicked: folderDialog.open()
+            TabButton {
+                text: "Local Folder"
             }
 
-            Label {
-                id: selectedFolderLabel
-                text: folderDialog.selectedFolder.toString() !== ""
-                    ? "Save to: " + folderDialog.selectedFolder.toString().replace("file://", "")
-                    : "No folder selected"
+            TabButton {
+                text: "NAS"
+                enabled: bridge && bridge.nasConnections.length > 0
+            }
+        }
+
+        StackLayout {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            currentIndex: destinationTabs.currentIndex
+
+            // Local folder tab
+            RowLayout {
                 Layout.fillWidth: true
-                wrapMode: Text.Wrap
-                elide: Text.ElideMiddle
+                spacing: 8
+
+                Button {
+                    text: "Select Folder"
+                    onClicked: folderDialog.open()
+                }
+
+                Label {
+                    id: selectedFolderLabel
+                    text: folderDialog.selectedFolder.toString() !== ""
+                        ? "Save to: " + folderDialog.selectedFolder.toString().replace("file://", "")
+                        : "No folder selected"
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    elide: Text.ElideMiddle
+                }
+            }
+
+            // NAS tab
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 8
+
+                Label {
+                    text: "Select NAS connection:"
+                }
+
+                ComboBox {
+                    id: nasConnectionBox
+                    Layout.fillWidth: true
+                    textRole: "name"
+                    valueRole: "id"
+                    model: bridge ? bridge.nasConnections : []
+                    enabled: bridge && bridge.nasConnections.length > 0
+                }
+
+                Label {
+                    text: {
+                        var conn = bridge && bridge.nasConnections ? bridge.nasConnections[nasConnectionBox.currentIndex] : null;
+                        if (conn) {
+                            return "Status: " + (conn.status === "connected" ? "Connected" : "Disconnected") +
+                                   "\nShare: " + conn.share;
+                        }
+                        return "";
+                    }
+                    color: "#666666"
+                    font.pointSize: 8
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                    visible: bridge && bridge.nasConnections.length > 0
+                }
+
+                Label {
+                    text: "No NAS connections configured. Add one in NAS Settings."
+                    color: "#888888"
+                    visible: bridge && bridge.nasConnections.length === 0
+                }
             }
         }
 
@@ -81,9 +151,21 @@ Popup {
 
             Button {
                 text: "Start Recording"
-                enabled: folderDialog.selectedFolder.toString() !== ""
+                enabled: {
+                    if (destinationTabs.currentIndex === 0) {
+                        return folderDialog.selectedFolder.toString() !== "";
+                    }
+                    return bridge && bridge.nasConnections.length > 0 && nasConnectionBox.currentIndex >= 0;
+                }
                 onClicked: {
-                    root.startRecording(folderDialog.selectedFolder.toString());
+                    if (destinationTabs.currentIndex === 0) {
+                        root.startRecording(folderDialog.selectedFolder.toString());
+                    } else {
+                        var connId = nasConnectionBox.currentValue;
+                        if (connId) {
+                            root.startRecordingToNas(connId);
+                        }
+                    }
                     root.close();
                 }
             }

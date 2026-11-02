@@ -6,6 +6,7 @@ from PySide6.QtCore import QObject, Signal, Slot, QUrl, QTimer, QDateTime
 from PySide6.QtMultimedia import QCamera, QCameraDevice, QMediaCaptureSession, QMediaDevices, QMediaFormat, QMediaMetaData, QMediaRecorder, QVideoSink
 
 from backend.device_worker import _decode_id
+from backend.nas_mount_helper import is_likely_nas_mount
 
 
 # Create a filesystem-safe lower-case slug from a device description.
@@ -58,6 +59,10 @@ class CaptureSessionWorker(QObject):
         self._segment_timer: QTimer = QTimer(self)
         self._segment_timer.setSingleShot(True)
         self._segment_timer.timeout.connect(self._on_segment_timer_timeout)
+
+        # Periodically verify that a NAS output folder is still reachable.
+        self._nas_health_timer: QTimer = QTimer(self)
+        self._nas_health_timer.timeout.connect(self._on_nas_health_check)
 
         self._output_folder: str | None = None
         self._active_output_path: str | None = None
@@ -194,7 +199,31 @@ class CaptureSessionWorker(QObject):
         if self._is_recording == is_recording:
             return
         self._is_recording = is_recording
+        if is_recording and self._output_folder and is_likely_nas_mount(self._output_folder):
+            self._nas_health_timer.start(5000)
+        else:
+            self._nas_health_timer.stop()
         self.recordingStateChanged.emit(self._device_id, self._is_recording)
+
+    def _on_nas_health_check(self) -> None:
+        if not self._is_recording or not self._output_folder:
+            return
+        if not is_likely_nas_mount(self._output_folder):
+            return
+        if os.path.isdir(self._output_folder) and os.access(self._output_folder, os.W_OK):
+            return
+        self.errorOccurred.emit(
+            self._device_id,
+            f"NAS destination '{self._output_folder}' is unreachable; stopping recording",
+        )
+        self._nas_health_timer.stop()
+        self._stop_requested = True
+        self._segment_timer.stop()
+        try:
+            if self._recorder is not None and self._recorder.recorderState() == QMediaRecorder.RecorderState.RecordingState:
+                self._recorder.stop()
+        except Exception as exc:
+            self.errorOccurred.emit(self._device_id, f"Failed to stop recording after NAS failure: {exc}")
 
     def _generate_output_path(self, folder_path: str) -> str:
         name = _sanitize_filename(self._camera_device.description()) if self._camera_device else "camera"
@@ -316,6 +345,7 @@ class CaptureSessionWorker(QObject):
         # Then clear Camera and Recorder
         self._stop_requested = True
         self._segment_timer.stop()
+        self._nas_health_timer.stop()
         try:
             if self._recorder is not None and self._is_recording:
                 self._recorder.stop()

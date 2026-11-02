@@ -9,6 +9,7 @@ from backend.qml_bridge import QmlBridge
 from backend.device_manager import DeviceManager
 from backend.capture_session_manager import CaptureSessionManager
 from backend.storage_manager import StorageManager
+from backend.nas_manager import NasManager
 
 
 def app_dir():
@@ -35,11 +36,14 @@ def main():
     # Manages storage policy, disk usage, and the background purge worker.
     storage_manager = StorageManager()
 
+    # Manages NAS connection metadata, mounts, and recording paths.
+    nas_manager = NasManager()
+
     # Manages live camera capture sessions on dedicated threads
-    capture_manager = CaptureSessionManager(device_manager, storage_manager)
+    capture_manager = CaptureSessionManager(device_manager, storage_manager, nas_manager)
 
     # Adapter layer that exposes backend state to QML
-    bridge = QmlBridge(device_manager, capture_manager, storage_manager)
+    bridge = QmlBridge(device_manager, capture_manager, storage_manager, nas_manager)
 
     # A fatal recording error should terminate the application rather than
     # repeatedly attempting to restart recording.

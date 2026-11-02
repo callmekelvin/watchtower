@@ -6,8 +6,9 @@ from PySide6.QtMultimedia import QVideoSink
 from backend.device_manager import DeviceManager
 from backend.capture_session_worker import CaptureSessionWorker
 
-# Avoid a runtime import cycle - StorageManager is only used for type hints.
+# Avoid runtime import cycles - these are only used for type hints.
 StorageManager = "StorageManager"
+NasManager = "NasManager"
 
 
 # CaptureSessionManager - Manages CaptureSessionWorker Threads, which perform multimedia processing
@@ -29,6 +30,9 @@ class CaptureSessionManager(QObject):
     # Arg: message
     fatalErrorOccurred = Signal(str)
 
+    # Emitted when any worker's recording state changes.
+    anyRecordingActiveChanged = Signal()
+
     # Internal signals used to deliver sink changes to workers on their own threads - Emit to all Camera Threads (Arg: device_id, Sink)
     _setWorkerVideoSink = Signal(str, QVideoSink)
     _clearWorkerVideoSink = Signal(str)
@@ -37,10 +41,17 @@ class CaptureSessionManager(QObject):
     _startRecordingForWorker = Signal(str, str)
     _stopRecordingForWorker = Signal(str)
 
-    def __init__(self, device_manager: DeviceManager, storage_manager: Optional[StorageManager] = None, parent: QObject | None = None):
+    def __init__(
+        self,
+        device_manager: DeviceManager,
+        storage_manager: Optional[StorageManager] = None,
+        nas_manager: Optional[NasManager] = None,
+        parent: QObject | None = None,
+    ):
         super().__init__(parent)
         self._device_manager = device_manager
         self._storage_manager: Optional[StorageManager] = storage_manager
+        self._nas_manager: Optional[NasManager] = nas_manager
 
         # Store Capture Session Workers/ Threads/ Sinks - { Key: DeviceID, Value: ... }
         self._workers: Dict[str, CaptureSessionWorker] = {}
@@ -54,12 +65,21 @@ class CaptureSessionManager(QObject):
         self._recording_folders: Dict[str, str] = {}
         self._active_files: Dict[str, str] = {}
 
+        # NAS recordings: device_id -> connection_id for pending/active NAS mounts.
+        self._pending_nas_recordings: Dict[str, str] = {}
+        self._active_nas_recordings: Dict[str, str] = {}
+
         # Set when storage is critical so no new segments are started.
         self._critical_stop_active: bool = False
 
         # Connect storage manager signals.
         if self._storage_manager is not None:
             self._storage_manager.storageCritical.connect(self._on_storage_critical)
+
+        # Connect NAS manager signals.
+        if self._nas_manager is not None:
+            self._nas_manager.recordingPathReady.connect(self._on_nas_recording_path_ready)
+            self._nas_manager.recordingMountFailed.connect(self._on_nas_recording_mount_failed)
 
         # Start a capture worker for every camera that the device manager detects.
         self._device_manager.videoInputsChanged.connect(self._on_video_inputs_changed)
@@ -73,6 +93,11 @@ class CaptureSessionManager(QObject):
     @Property(bool, notify=cameraActiveChanged)
     def cameraActive(self) -> bool:
         return self._camera_active
+
+    # Property - True while any camera is recording (local or NAS).
+    @Property(bool, notify=anyRecordingActiveChanged)
+    def anyRecordingActive(self) -> bool:
+        return any(self._recording_states.values())
 
     # Function - Register the QVideoSink for a specific camera. The sink is created by QML's VideoOutput
     @Slot(str, QVideoSink)
@@ -109,14 +134,38 @@ class CaptureSessionManager(QObject):
     # Stop all Capture Session Workers/ Threads
     @Slot()
     def stopAll(self) -> None:
+        self._pending_nas_recordings.clear()
         for device_id in list(self._workers.keys()):
             self._stop_session(device_id)
         self._set_current_device_id("")
         self._set_camera_active(False)
 
-    # Start recording the specified device to the given folder.
+    # Start recording the specified device to the given local folder.
     @Slot(str, str)
     def startRecordingForDevice(self, device_id: str, folder_path: str) -> None:
+        self._begin_recording(device_id, folder_path, nas_connection_id=None)
+
+    # Start recording the specified device to a configured NAS connection.
+    # This mounts the share asynchronously and then begins recording.
+    @Slot(str, str)
+    def startRecordingToNas(self, device_id: str, connection_id: str) -> None:
+        if not device_id or not connection_id:
+            return
+        if self._nas_manager is None:
+            self.errorOccurred.emit("NAS support is not available")
+            return
+        if device_id in self._pending_nas_recordings or device_id in self._active_nas_recordings:
+            return
+        self._pending_nas_recordings[device_id] = connection_id
+        self._nas_manager.mountForRecording(connection_id, device_id)
+
+    # Internal recording start helper shared by local and NAS flows.
+    def _begin_recording(
+        self,
+        device_id: str,
+        folder_path: str,
+        nas_connection_id: Optional[str] = None,
+    ) -> None:
         if not device_id:
             return
 
@@ -126,6 +175,8 @@ class CaptureSessionManager(QObject):
         local_path = url.toLocalFile() if url.isLocalFile() else folder_path
         if not local_path:
             self.errorOccurred.emit(f"Invalid output folder: {folder_path}")
+            if nas_connection_id and self._nas_manager is not None:
+                self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, False)
             return
 
         # Check if there is sufficient space to begin recording
@@ -134,6 +185,8 @@ class CaptureSessionManager(QObject):
             min_free_gb = self._storage_manager.minFreeSpaceGb
             if free_gb < min_free_gb:
                 self.errorOccurred.emit(f"Insufficient free space ({free_gb:.2f} GB). Recording requires at least {min_free_gb} GB.")
+                if nas_connection_id and self._nas_manager is not None:
+                    self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, False)
                 return
 
         # There is sufficient space/ space has been made available since last check
@@ -144,6 +197,10 @@ class CaptureSessionManager(QObject):
 
         if device_id in self._workers:
             self._recording_folders[device_id] = local_path
+            if nas_connection_id:
+                self._active_nas_recordings[device_id] = nas_connection_id
+                if self._nas_manager is not None:
+                    self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, True)
             self._update_storage_manager()
             self._startRecordingForWorker.emit(device_id, folder_path)
 
@@ -240,6 +297,10 @@ class CaptureSessionManager(QObject):
 
         self._recording_folders.pop(device_id, None)
         self._active_files.pop(device_id, None)
+        self._pending_nas_recordings.pop(device_id, None)
+        nas_connection_id = self._active_nas_recordings.pop(device_id, None)
+        if nas_connection_id and self._nas_manager is not None:
+            self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, False)
         self._update_storage_manager()
 
         try:
@@ -262,6 +323,10 @@ class CaptureSessionManager(QObject):
         self._threads.pop(device_id, None)
         self._recording_folders.pop(device_id, None)
         self._active_files.pop(device_id, None)
+        self._pending_nas_recordings.pop(device_id, None)
+        nas_connection_id = self._active_nas_recordings.pop(device_id, None)
+        if nas_connection_id and self._nas_manager is not None:
+            self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, False)
         self._update_storage_manager()
 
     # Worker Signal Functions
@@ -275,22 +340,46 @@ class CaptureSessionManager(QObject):
         self.errorOccurred.emit(message)
 
     def _on_worker_stopped(self, device_id: str) -> None:
+        old_any_active = self.anyRecordingActive
         if self._current_device_id == device_id:
             self._set_current_device_id("")
             self._set_camera_active(False)
         self._recording_states.pop(device_id, None)
         self._recording_folders.pop(device_id, None)
         self._active_files.pop(device_id, None)
+        self._pending_nas_recordings.pop(device_id, None)
+        nas_connection_id = self._active_nas_recordings.pop(device_id, None)
+        if nas_connection_id and self._nas_manager is not None:
+            self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, False)
         self._update_storage_manager()
+        if self.anyRecordingActive != old_any_active:
+            self.anyRecordingActiveChanged.emit()
         self.sessionStopped.emit(device_id)
 
     def _on_worker_recording_state_changed(self, device_id: str, is_recording: bool) -> None:
+        old_any_active = self.anyRecordingActive
         self._recording_states[device_id] = is_recording
         if not is_recording:
             self._recording_folders.pop(device_id, None)
             self._active_files.pop(device_id, None)
+            nas_connection_id = self._active_nas_recordings.pop(device_id, None)
+            if nas_connection_id and self._nas_manager is not None:
+                self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, False)
         self._update_storage_manager()
         self.deviceRecordingStateChanged.emit(device_id, is_recording)
+        if self.anyRecordingActive != old_any_active:
+            self.anyRecordingActiveChanged.emit()
+
+    def _on_nas_recording_path_ready(self, device_id: str, local_path: str) -> None:
+        connection_id = self._pending_nas_recordings.pop(device_id, None)
+        if connection_id is None:
+            return
+        self._begin_recording(device_id, local_path, nas_connection_id=connection_id)
+
+    def _on_nas_recording_mount_failed(self, device_id: str, message: str) -> None:
+        self._pending_nas_recordings.pop(device_id, None)
+        self._active_nas_recordings.pop(device_id, None)
+        self.errorOccurred.emit(message)
 
     def _on_segment_started(self, device_id: str, file_path: str) -> None:
         self._active_files[device_id] = file_path

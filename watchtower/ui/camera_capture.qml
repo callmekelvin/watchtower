@@ -156,6 +156,11 @@ Rectangle {
                 bridge.captureManager.startRecordingForDevice(root.device.deviceId, folderPath);
             }
         }
+        onStartRecordingToNas: connectionId => {
+            if (bridge && bridge.captureManager && root.device) {
+                bridge.startRecordingToNas(root.device.deviceId, connectionId);
+            }
+        }
     }
 
     Connections {

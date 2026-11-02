@@ -6,6 +6,7 @@ from PySide6.QtCore import QObject, Signal, Slot, Property
 from backend.device_manager import DeviceManager
 from backend.capture_session_manager import CaptureSessionManager
 from backend.storage_manager import StorageManager
+from backend.nas_manager import NasManager
 
 def _device_to_dict(device) -> Dict[str, Any]:
     return {
@@ -44,14 +45,23 @@ class QmlBridge(QObject):
     storageStatusChanged = Signal()
     storageCritical = Signal(str)
 
+    # NAS Manager Signals
+    nasConnectionsChanged = Signal()
+    anyRecordingActiveChanged = Signal()
+
     # Emitted when a recording failure should terminate the application.
     fatalErrorOccurred = Signal(str)
 
-    def __init__(self, device_manager: DeviceManager, capture_manager: CaptureSessionManager, storage_manager: StorageManager, parent: QObject | None = None):
+    # Emitted when the NAS manager needs a password from the user.
+    # Args: connection_id, title, message
+    nasPasswordPromptRequested = Signal(str, str, str)
+
+    def __init__(self, device_manager: DeviceManager, capture_manager: CaptureSessionManager, storage_manager: StorageManager, nas_manager: NasManager, parent: QObject | None = None):
         super().__init__(parent)
         self._device_manager = device_manager
         self._capture_manager = capture_manager
         self._storage_manager = storage_manager
+        self._nas_manager = nas_manager
 
         # Forward device manager signals
         self._device_manager.videoInputsChanged.connect(self.videoInputsChanged)
@@ -65,6 +75,12 @@ class QmlBridge(QObject):
 
         # Forward fatal recording errors from the capture manager.
         self._capture_manager.fatalErrorOccurred.connect(self.fatalErrorOccurred)
+        self._capture_manager.anyRecordingActiveChanged.connect(self.anyRecordingActiveChanged)
+
+        # Forward NAS signals.
+        self._nas_manager.connectionStatusChanged.connect(self.nasConnectionsChanged)
+        self._nas_manager.errorOccurred.connect(self.errorOccurred)
+        self._nas_manager.passwordPromptRequested.connect(self.nasPasswordPromptRequested)
 
     # Property - Retrieve/ Subscribe to Cached Device List
     @Property(list, notify=videoInputsChanged)
@@ -163,3 +179,45 @@ class QmlBridge(QObject):
     @Slot()
     def clearManagedFolders(self) -> None:
         self._storage_manager.clearManagedFolders()
+
+    # ------------------------------------------------------------------
+    # NAS properties
+    # ------------------------------------------------------------------
+    @Property(QObject, constant=True)
+    def nasManager(self) -> NasManager:
+        return self._nas_manager
+
+    @Property(list, notify=nasConnectionsChanged)
+    def nasConnections(self) -> List[Dict[str, Any]]:
+        return self._nas_manager.connections
+
+    @Property(bool, notify=anyRecordingActiveChanged)
+    def anyRecordingActive(self) -> bool:
+        return self._capture_manager.anyRecordingActive
+
+    # ------------------------------------------------------------------
+    # NAS slots
+    # ------------------------------------------------------------------
+    @Slot(dict)
+    def saveNasConnection(self, data: Dict[str, Any]) -> None:
+        self._nas_manager.saveConnection(data)
+
+    @Slot(str)
+    def deleteNasConnection(self, connection_id: str) -> None:
+        self._nas_manager.deleteConnection(connection_id)
+
+    @Slot(str)
+    def requestNasConnect(self, connection_id: str) -> None:
+        self._nas_manager.requestConnect(connection_id)
+
+    @Slot(str)
+    def requestNasDisconnect(self, connection_id: str) -> None:
+        self._nas_manager.requestDisconnect(connection_id)
+
+    @Slot(str, str)
+    def submitNasPassword(self, connection_id: str, password: str) -> None:
+        self._nas_manager.submitPassword(connection_id, password)
+
+    @Slot(str, str)
+    def startRecordingToNas(self, device_id: str, connection_id: str) -> None:
+        self._capture_manager.startRecordingToNas(device_id, connection_id)

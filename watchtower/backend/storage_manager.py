@@ -4,6 +4,7 @@ from typing import List, Set
 from PySide6.QtCore import QObject, QDir, QSettings, QStorageInfo, QThread, Signal, Slot, Property, QTimer
 
 from backend.storage_purge_worker import StoragePurgeWorker
+from backend.nas_mount_helper import get_network_free_space_gb, is_likely_nas_mount
 
 
 class StorageManager(QObject):
@@ -327,8 +328,23 @@ class StorageManager(QObject):
         info = self._storage_info(path)
         available = info.bytesAvailable()
         if available < 0:
-            return 0.0
+            available = 0
+        # For NAS mounts QStorageInfo can report unreliable values; fall back
+        # to a platform command that inspects the network filesystem.
+        if (available <= 0 or self._storage_info_unreliable(path)) and is_likely_nas_mount(path):
+            fallback = get_network_free_space_gb(path)
+            if fallback is not None:
+                return fallback
         return available / (1024 ** 3)
+
+    def _storage_info_unreliable(self, path: str) -> bool:
+        """Return True when QStorageInfo values look unreliable for ``path``."""
+        info = self._storage_info(path)
+        # A zero total on an existing folder usually means the volume info was
+        # not resolved (common with some network mounts).
+        if path and os.path.exists(path) and info.bytesTotal() <= 0:
+            return True
+        return False
 
     # Get Total Storage
     def _total_space_gb(self, path: str) -> float:
@@ -350,10 +366,10 @@ class StorageManager(QObject):
     # Format Storage information from Bytes to GB as String
     def _status_text(self) -> str:
         info = self._storage_info(self._status_root_path())
-        free_gb = info.bytesAvailable() / (1024 ** 3)
+        free_gb = self._free_space_gb(self._status_root_path())
         total_gb = info.bytesTotal() / (1024 ** 3)
         if total_gb <= 0:
-            return "Disk usage unavailable"
+            return f"{free_gb:.2f} GB free"
         used_gb = total_gb - free_gb
         ratio = self._usage_ratio() * 100.0
         return (f"{free_gb:.2f} GB free of {total_gb:.2f} GB ({used_gb:.2f} GB used, {ratio:.1f}%)")

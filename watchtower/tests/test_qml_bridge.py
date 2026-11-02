@@ -41,6 +41,7 @@ class FakeCaptureManager(QObject):
     sessionStopped = Signal(str)
     deviceRecordingStateChanged = Signal(str, bool)
     segmentFinalized = Signal(str, str)
+    anyRecordingActiveChanged = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -50,9 +51,16 @@ class FakeCaptureManager(QObject):
     def currentDeviceId(self):
         return self._current_device_id
 
+    @property
+    def anyRecordingActive(self):
+        return False
+
     def setCameraById(self, device_id):
         self._current_device_id = device_id
         self.currentDeviceIdChanged.emit()
+
+    def startRecordingToNas(self, device_id, connection_id):
+        pass
 
 
 class FakeStorageManager(QObject):
@@ -113,12 +121,49 @@ class FakeStorageManager(QObject):
         self.policyChanged.emit()
 
 
+class FakeNasManager(QObject):
+    connectionStatusChanged = Signal()
+    errorOccurred = Signal(str)
+    passwordPromptRequested = Signal(str, str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._connections = []
+
+    @property
+    def connections(self):
+        return self._connections
+
+    @property
+    def anyNasRecordingActive(self):
+        return False
+
+    def saveConnection(self, data):
+        self.connectionStatusChanged.emit()
+
+    def deleteConnection(self, connection_id):
+        self.connectionStatusChanged.emit()
+
+    def requestConnect(self, connection_id):
+        pass
+
+    def requestDisconnect(self, connection_id):
+        pass
+
+    def submitPassword(self, connection_id, password):
+        pass
+
+    def mountForRecording(self, connection_id, device_id):
+        pass
+
+
 @pytest.fixture
 def bridge(qtbot):
     device_mgr = FakeDeviceManager()
     capture_mgr = FakeCaptureManager()
     storage_mgr = FakeStorageManager()
-    return QmlBridge(device_mgr, capture_mgr, storage_mgr)
+    nas_mgr = FakeNasManager()
+    return QmlBridge(device_mgr, capture_mgr, storage_mgr, nas_mgr)
 
 
 def test_video_inputs_returns_dict_list(bridge):
@@ -169,3 +214,17 @@ def test_refresh_devices_delegates(bridge):
     bridge._device_manager.refresh = MagicMock()
     bridge.refreshDevices()
     bridge._device_manager.refresh.assert_called_once()
+
+
+def test_nas_connection_delegates(qtbot, bridge):
+    original_save = bridge._nas_manager.saveConnection
+    bridge._nas_manager.saveConnection = MagicMock(side_effect=lambda data: original_save(data))
+    with qtbot.waitSignal(bridge.nasConnectionsChanged, timeout=1000):
+        bridge.saveNasConnection({"name": "Test", "protocol": "smb", "host": "nas", "share": "rec"})
+    bridge._nas_manager.saveConnection.assert_called_once()
+
+
+def test_start_recording_to_nas_delegates(bridge):
+    bridge._capture_manager.startRecordingToNas = MagicMock()
+    bridge.startRecordingToNas("cam-1", "conn-1")
+    bridge._capture_manager.startRecordingToNas.assert_called_once_with("cam-1", "conn-1")

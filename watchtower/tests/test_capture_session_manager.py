@@ -118,3 +118,17 @@ def test_segment_started_tracks_active_file(capture_manager):
 def test_segment_finalized_emits_signal(qtbot, capture_manager):
     with qtbot.waitSignal(capture_manager.segmentFinalized, timeout=1000):
         capture_manager._on_segment_finalized("cam-1", "/tmp/out/final.mp4")
+
+
+def test_start_recording_to_nas_without_nas_manager_emits_error(qtbot, capture_manager):
+    capture_manager._nas_manager = None
+    with qtbot.waitSignal(capture_manager.errorOccurred, timeout=1000):
+        capture_manager.startRecordingToNas("cam-1", "conn-1")
+
+
+def test_start_recording_to_nas_delegates_to_nas_manager(capture_manager):
+    nas = MagicMock()
+    capture_manager._nas_manager = nas
+    capture_manager.startRecordingToNas("cam-1", "conn-1")
+    nas.mountForRecording.assert_called_once_with("conn-1", "cam-1")
+    assert capture_manager._pending_nas_recordings["cam-1"] == "conn-1"

@@ -14,11 +14,12 @@ from backend.storage_purge_worker import (
 
 @pytest.fixture
 def mock_storage_info(monkeypatch):
-    """Replace QStorageInfo so bytesAvailable returns a configurable value."""
+    """Replace QStorageInfo so bytesAvailable/total return configurable values."""
 
-    def _make(available_bytes: int):
+    def _make(available_bytes: int, total_bytes: int = 100 * 1024 ** 3):
         instance = MagicMock()
         instance.bytesAvailable.return_value = available_bytes
+        instance.bytesTotal.return_value = total_bytes
 
         class FakeStorageInfo:
             def __init__(self, *args, **kwargs):
@@ -26,6 +27,9 @@ def mock_storage_info(monkeypatch):
 
             def bytesAvailable(self):
                 return available_bytes
+
+            def bytesTotal(self):
+                return total_bytes
 
         monkeypatch.setattr(
             "backend.storage_purge_worker.QStorageInfo",
@@ -163,7 +167,7 @@ def test_perform_purge_emits_purged_files(qtbot, mock_storage_info, temp_folder)
 
 def test_purge_aborts_when_free_space_unknown(mock_storage_info, temp_folder, qtbot):
     """If QStorageInfo cannot determine free space, no files should be deleted."""
-    mock_storage_info(-1)
+    mock_storage_info(-1, -1)
 
     old_file = make_recording(temp_folder, "cam_20230101_120000_000.mp4")
     worker = StoragePurgeWorker()
@@ -192,3 +196,53 @@ def test_purge_normalizes_protected_file_paths(mock_storage_info, temp_folder):
 
     assert str(old) not in deleted
     assert str(newer) in deleted
+
+
+def test_purge_continues_after_delete_failure(mock_storage_info, temp_folder, monkeypatch, qtbot):
+    """A single delete failure must be non-fatal and reported via purgeFailed."""
+    mock_storage_info(0)
+
+    old = make_recording(temp_folder, "cam_20230101_120000_000.mp4")
+    newer = make_recording(temp_folder, "cam_20230102_120000_000.mp4")
+
+    original_remove = __import__("os").remove
+    def flaky_remove(path):
+        if path == str(old):
+            raise OSError("network unavailable")
+        original_remove(path)
+
+    monkeypatch.setattr("os.remove", flaky_remove)
+
+    worker = StoragePurgeWorker()
+    with qtbot.waitSignal(worker.purgeFailed) as blocker:
+        deleted = worker._purge(
+            [str(temp_folder)], set(), 10 * 1024 ** 3, 86400 * 365, str(temp_folder)
+        )
+
+    assert str(old) not in deleted
+    assert old.exists()
+    assert str(newer) in deleted
+    assert "network unavailable" in blocker.args[0]
+
+
+def test_purge_uses_network_free_space_fallback_for_nas_mount(
+    mock_storage_info, temp_folder, monkeypatch
+):
+    """When QStorageInfo is unreliable for a NAS path, fall back to df/wmic."""
+    # Simulate QStorageInfo returning no usable value.
+    mock_storage_info(-1)
+
+    monkeypatch.setattr(
+        "backend.storage_purge_worker.is_likely_nas_mount", lambda _path: True
+    )
+    monkeypatch.setattr(
+        "backend.storage_purge_worker.get_network_free_space_gb",
+        lambda _path: 100.0,
+    )
+
+    old = make_recording(temp_folder, "cam_20230101_120000_000.mp4")
+    worker = StoragePurgeWorker()
+    deleted = worker._purge(
+        [str(temp_folder)], set(), 0, 86400, str(temp_folder)
+    )
+    assert str(old) in deleted
