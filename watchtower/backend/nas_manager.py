@@ -5,7 +5,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from PySide6.QtCore import QObject, QSettings, Signal, Slot, Property, QThread, QTimer
+from PySide6.QtCore import (
+    QObject,
+    QSettings,
+    Signal,
+    Slot,
+    Property,
+    QThread,
+    QTimer,
+    Qt,
+)
 
 from backend.nas_connection import NasConnection, NasProtocol
 from backend.nas_mount_helper import (
@@ -28,17 +37,21 @@ class _MountState:
 class NasMountWorker(QObject):
     """Background worker that unmounts a stale share and remounts it."""
 
-    # connection_id, success, error, mount_point_str, drive_letter
-    finished = Signal(str, bool, str, str, str)
+    # connection_id, operation, success, error, mount_point_str, drive_letter
+    finished = Signal(str, str, bool, str, str, str)
 
     def __init__(
         self,
         connection: NasConnection,
+        operation: str,
+        password: str = "",
         previous_state: Optional[_MountState] = None,
         parent: QObject | None = None,
     ):
         super().__init__(parent)
         self._connection = connection
+        self._operation = operation
+        self._password = password
         self._previous_state = previous_state
 
     @Slot()
@@ -60,7 +73,7 @@ class NasMountWorker(QObject):
             )
 
             success, used_drive_letter, error = mount_share(
-                self._connection, mount_point, "", drive_letter
+                self._connection, mount_point, self._password, drive_letter
             )
 
             if success:
@@ -72,6 +85,7 @@ class NasMountWorker(QObject):
                 else:
                     self.finished.emit(
                         self._connection.id,
+                        self._operation,
                         True,
                         "",
                         str(mount_point),
@@ -80,10 +94,47 @@ class NasMountWorker(QObject):
                     return
 
             self.finished.emit(
-                self._connection.id, False, error or "Mount failed", "", ""
+                self._connection.id,
+                self._operation,
+                False,
+                error or "Mount failed",
+                "",
+                "",
             )
         except Exception as exc:
-            self.finished.emit(self._connection.id, False, str(exc), "", "")
+            self.finished.emit(
+                self._connection.id, self._operation, False, str(exc), "", ""
+            )
+        finally:
+            # Clear the password from memory as soon as the mount attempt ends.
+            self._password = ""
+
+
+class NasUnmountWorker(QObject):
+    """Background worker that unmounts a share."""
+
+    # connection_id, success, error, previous_state
+    finished = Signal(str, bool, str, object)
+
+    def __init__(
+        self,
+        connection_id: str,
+        state: _MountState,
+        parent: QObject | None = None,
+    ):
+        super().__init__(parent)
+        self._connection_id = connection_id
+        self._state = state
+
+    @Slot()
+    def perform_unmount(self) -> None:
+        try:
+            success, error = unmount_share(
+                self._state.mount_point, self._state.drive_letter
+            )
+            self.finished.emit(self._connection_id, success, error, self._state)
+        except Exception as exc:
+            self.finished.emit(self._connection_id, False, str(exc), self._state)
 
 
 class NasRecoveryWatcher(QObject):
@@ -98,7 +149,7 @@ class NasRecoveryWatcher(QObject):
         self._watched: Set[str] = set()
         self._in_progress: Set[str] = set()
         # Keep workers alive while their background threads are running.
-        self._active_workers: Set[QObject] = set()
+        self._active_workers: Dict[QThread, QObject] = {}
 
         self._timer = QTimer(self)
         self._timer.setInterval(60_000)  # 60 seconds
@@ -141,32 +192,31 @@ class NasRecoveryWatcher(QObject):
         self._in_progress.add(connection_id)
 
         thread = QThread(self)
-        worker = NasMountWorker(conn, previous_state)
-        self._active_workers.add(worker)
+        worker = NasMountWorker(conn, operation="", previous_state=previous_state)
+        self._active_workers[thread] = worker
         worker.moveToThread(thread)
 
         thread.started.connect(worker.perform_mount)
-        worker.finished.connect(self._on_mount_finished)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(self._cleanup_worker)
+        worker.finished.connect(self._on_mount_finished, Qt.QueuedConnection)
+        worker.finished.connect(thread.quit, Qt.QueuedConnection)
+        thread.finished.connect(self._cleanup_worker, Qt.QueuedConnection)
 
         self._nas._recovery_threads[connection_id] = thread
         thread.start()
 
     def _cleanup_worker(self) -> None:
-        """Delete a finished worker once its thread has quit."""
+        """Delete a finished worker that has been moved back to the main thread."""
         thread = self.sender()
-        for worker in list(self._active_workers):
-            if worker.thread() is thread:
-                self._active_workers.discard(worker)
-                worker.deleteLater()
-                break
+        worker = self._active_workers.pop(thread, None)
+        if worker is not None:
+            worker.deleteLater()
         if thread is not None:
             thread.deleteLater()
 
     def _on_mount_finished(
         self,
         connection_id: str,
+        _operation: str,
         success: bool,
         error: str,
         mount_point_str: str,
@@ -194,6 +244,9 @@ class NasManager(QObject):
     Connection metadata is persisted via QSettings.  Passwords are never stored;
     they are requested from the UI at runtime and held in memory only for the
     duration of a mount operation.
+
+    All mount and unmount operations run on background threads so the GUI
+    remains responsive while network I/O is in progress.
     """
 
     # Emitted whenever the connection list or a connection status changes.
@@ -242,6 +295,12 @@ class NasManager(QObject):
 
         # Tracks background recovery threads so they can be cleaned up.
         self._recovery_threads: Dict[str, QThread] = {}
+        # Tracks background operation threads (connect / disconnect).
+        self._operation_threads: Dict[str, QThread] = {}
+        # Tracks active operation workers so they are not garbage collected.
+        self._active_workers: Dict[QThread, QObject] = {}
+        # connection_ids with a mount/unmount operation currently in progress.
+        self._operation_in_progress: Set[str] = set()
 
         self._recovery_watcher = NasRecoveryWatcher(self)
         self._recovery_watcher.connectionRestored.connect(self.connectionRestored)
@@ -316,7 +375,7 @@ class NasManager(QObject):
             return
 
         if conn.protocol == NasProtocol.NFS:
-            self._perform_mount(connection_id, "", "connect")
+            self._start_mount_worker(connection_id, "", "connect")
             return
 
         self._pending_password_for = connection_id
@@ -341,14 +400,24 @@ class NasManager(QObject):
             self.connectionManuallyDisconnected.emit(connection_id)
             return
 
-        success, error = unmount_share(state.mount_point, state.drive_letter)
-        if not success:
-            # Restore state so the UI still reflects the previously mounted share.
+        if connection_id in self._operation_in_progress:
+            # Restore state so the UI still reflects the mounted share.
             self._mount_states[connection_id] = state
-            self.errorOccurred.emit(error or "Failed to disconnect NAS")
-        else:
-            self.connectionStatusChanged.emit()
-            self.connectionManuallyDisconnected.emit(connection_id)
+            return
+
+        self._operation_in_progress.add(connection_id)
+        thread = QThread(self)
+        worker = NasUnmountWorker(connection_id, state)
+        self._active_workers[thread] = worker
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.perform_unmount)
+        worker.finished.connect(self._on_unmount_finished, Qt.QueuedConnection)
+        worker.finished.connect(thread.quit, Qt.QueuedConnection)
+        thread.finished.connect(self._cleanup_worker, Qt.QueuedConnection)
+
+        self._operation_threads[connection_id] = thread
+        thread.start()
 
     @Slot(str, str)
     def submitPassword(self, connection_id: str, password: str) -> None:
@@ -360,32 +429,61 @@ class NasManager(QObject):
         operation = self._pending_operation
         self._pending_operation = None
 
-        self._perform_mount(connection_id, password, operation)
+        if operation is None:
+            return
 
-    def _perform_mount(
-        self, connection_id: str, password: str, operation: Optional[str]
+        self._start_mount_worker(connection_id, password, operation)
+
+    def _start_mount_worker(
+        self,
+        connection_id: str,
+        password: str,
+        operation: str,
+        previous_state: Optional[_MountState] = None,
     ) -> None:
-        """Execute a mount for the given connection and dispatch results."""
+        """Queue a mount operation on a background thread."""
         conn = self._connections.get(connection_id)
         if conn is None:
             return
 
-        mount_point = get_default_mount_point(connection_id)
-        drive_letter = (
-            find_available_drive_letter()
-            if platform.system() == "Windows"
-            else None
-        )
+        if connection_id in self._operation_in_progress:
+            return
+        self._operation_in_progress.add(connection_id)
 
-        # The password is held in memory only for the mount operation.
-        try:
-            success, used_drive_letter, error = mount_share(
-                conn, mount_point, password, drive_letter
-            )
-        finally:
-            # Explicitly clear the local password reference as soon as possible.
-            password = ""
-            del password
+        if previous_state is None:
+            # Remove any stale state so the UI shows "disconnected" while mounting.
+            previous_state = self._mount_states.pop(connection_id, None)
+
+        thread = QThread(self)
+        worker = NasMountWorker(
+            conn,
+            operation=operation,
+            password=password,
+            previous_state=previous_state,
+        )
+        self._active_workers[thread] = worker
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.perform_mount)
+        worker.finished.connect(self._on_mount_finished, Qt.QueuedConnection)
+        worker.finished.connect(thread.quit, Qt.QueuedConnection)
+        thread.finished.connect(self._cleanup_worker, Qt.QueuedConnection)
+
+        self._operation_threads[connection_id] = thread
+        thread.start()
+
+    def _on_mount_finished(
+        self,
+        connection_id: str,
+        operation: str,
+        success: bool,
+        error: str,
+        mount_point_str: str,
+        drive_letter: str,
+    ) -> None:
+        """Handle completion of a background mount operation."""
+        self._operation_in_progress.discard(connection_id)
+        self._operation_threads.pop(connection_id, None)
 
         if not success:
             self.errorOccurred.emit(error or "Failed to mount NAS")
@@ -394,12 +492,42 @@ class NasManager(QObject):
                 self.recordingMountFailed.emit(device_id, error or "Failed to mount NAS")
             return
 
-        self._mount_states[connection_id] = _MountState(mount_point, used_drive_letter)
+        mount_point = Path(mount_point_str)
+        self._mount_states[connection_id] = _MountState(mount_point, drive_letter or None)
         self.connectionStatusChanged.emit()
 
         if operation and operation.startswith("record:"):
             device_id = operation.split(":", 1)[1]
             self._prepare_recording_path(device_id, connection_id)
+
+    def _on_unmount_finished(
+        self,
+        connection_id: str,
+        success: bool,
+        error: str,
+        state: _MountState,
+    ) -> None:
+        """Handle completion of a background unmount operation."""
+        self._operation_in_progress.discard(connection_id)
+        self._operation_threads.pop(connection_id, None)
+
+        if not success:
+            # Restore state so the UI still reflects the previously mounted share.
+            self._mount_states[connection_id] = state
+            self.errorOccurred.emit(error or "Failed to disconnect NAS")
+            return
+
+        self.connectionStatusChanged.emit()
+        self.connectionManuallyDisconnected.emit(connection_id)
+
+    def _cleanup_worker(self) -> None:
+        """Delete a finished worker that has been moved back to the main thread."""
+        thread = self.sender()
+        worker = self._active_workers.pop(thread, None)
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            thread.deleteLater()
 
     @Slot(str, str)
     def mountForRecording(self, connection_id: str, device_id: str) -> None:
@@ -421,7 +549,7 @@ class NasManager(QObject):
             return
 
         if conn.protocol == NasProtocol.NFS:
-            self._perform_mount(connection_id, "", f"record:{device_id}")
+            self._start_mount_worker(connection_id, "", f"record:{device_id}")
             return
 
         self._pending_password_for = connection_id

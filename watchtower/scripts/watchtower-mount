@@ -1,0 +1,51 @@
+#!/bin/bash
+# Watchtower privileged mount helper.
+# Validates that the requested mount point is inside the application's
+# managed mount namespace and then delegates to the real mount command.
+set -euo pipefail
+
+if [ "$EUID" -ne 0 ]; then
+    echo "watchtower-mount must be run as root" >&2
+    exit 1
+fi
+
+if [ "$#" -lt 2 ]; then
+    echo "Usage: watchtower-mount <mount args...>" >&2
+    exit 1
+fi
+
+USER_NAME="${SUDO_USER:-}"
+if [ -z "$USER_NAME" ]; then
+    echo "SUDO_USER is not set" >&2
+    exit 1
+fi
+
+USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
+if [ -z "$USER_HOME" ]; then
+    echo "Could not determine home directory for user: $USER_NAME" >&2
+    exit 1
+fi
+
+APP_DATA_DIR="${USER_HOME}/.local/share/Watchtower/mounts"
+
+# The mount point is expected to be the last positional argument.
+MOUNT_POINT_ARG="${!#}"
+
+if [ ! -e "$MOUNT_POINT_ARG" ]; then
+    echo "Mount point does not exist: $MOUNT_POINT_ARG" >&2
+    exit 1
+fi
+
+MOUNT_POINT=$(realpath -e "$MOUNT_POINT_ARG")
+
+case "$MOUNT_POINT" in
+    "$APP_DATA_DIR"/*)
+        ;;
+    *)
+        echo "Invalid mount point: $MOUNT_POINT (must be under $APP_DATA_DIR)" >&2
+        exit 1
+        ;;
+esac
+
+MOUNT_BIN=$(command -v mount)
+exec "$MOUNT_BIN" "$@"

@@ -1,3 +1,4 @@
+import time
 from typing import Dict, Optional, Set
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot, Property, QMetaObject, Qt, QUrl
@@ -66,6 +67,11 @@ class CaptureSessionManager(QObject):
         self._recording_folders: Dict[str, str] = {}
         self._active_files: Dict[str, str] = {}
 
+        # Desired recordings: set when the user explicitly starts recording and
+        # cleared when the user stops or a fatal error occurs.  Used to auto-resume
+        # recording after a camera session restart.
+        self._desired_local_recordings: Dict[str, str] = {}
+
         # NAS recordings:
         #   pending -> device_id -> connection_id while a mount is in progress.
         #   active  -> device_id -> connection_id currently recording.
@@ -78,6 +84,20 @@ class CaptureSessionManager(QObject):
         self._paused_nas_recordings: Dict[str, str] = {}
         # connection_id -> count of desired/paused recordings using it.
         self._nas_watch_refs: Dict[str, int] = {}
+
+        # Per-device restart bookkeeping to avoid tight restart loops.
+        self._pending_restarts: Set[str] = set()
+        self._restart_attempts: Dict[str, int] = {}
+        self._restart_attempt_times: Dict[str, float] = {}
+        _RESTART_WINDOW_SECONDS = 30
+        _MAX_RESTARTS_IN_WINDOW = 3
+        self._restart_window_seconds = _RESTART_WINDOW_SECONDS
+        self._max_restarts_in_window = _MAX_RESTARTS_IN_WINDOW
+
+        # Workers that are being stopped but whose thread has not finished yet.
+        # Key: QThread, Value: CaptureSessionWorker.  Used so cleanup can move
+        # the worker back to the main thread before deleting it.
+        self._pending_cleanup: Dict[QThread, CaptureSessionWorker] = {}
 
         # Set when storage is critical so no new segments are started.
         self._critical_stop_active: bool = False
@@ -149,20 +169,28 @@ class CaptureSessionManager(QObject):
     @Slot()
     def stopAll(self) -> None:
         self._pending_nas_recordings.clear()
+        self._desired_local_recordings.clear()
+        self._desired_nas_recordings.clear()
+        self._paused_nas_recordings.clear()
+        self._pending_restarts.clear()
         if self._nas_manager is not None:
             for connection_id in list(self._nas_watch_refs.keys()):
                 self._nas_manager.unregisterRecoveryWatch(connection_id)
         self._nas_watch_refs.clear()
-        self._desired_nas_recordings.clear()
-        self._paused_nas_recordings.clear()
         for device_id in list(self._workers.keys()):
-            self._stop_session(device_id)
+            self._stop_session(device_id, blocking=True)
         self._set_current_device_id("")
         self._set_camera_active(False)
 
     # Start recording the specified device to the given local folder.
     @Slot(str, str)
     def startRecordingForDevice(self, device_id: str, folder_path: str) -> None:
+        url = QUrl(folder_path)
+        local_path = url.toLocalFile() if url.isLocalFile() else folder_path
+        if not local_path:
+            self.errorOccurred.emit(f"Invalid output folder: {folder_path}")
+            return
+        self._desired_local_recordings[device_id] = local_path
         self._begin_recording(device_id, folder_path, nas_connection_id=None)
 
     # Start recording the specified device to a configured NAS connection.
@@ -210,6 +238,7 @@ class CaptureSessionManager(QObject):
             min_free_gb = self._storage_manager.minFreeSpaceGb
             if free_gb < min_free_gb:
                 self.errorOccurred.emit(f"Insufficient free space ({free_gb:.2f} GB). Recording requires at least {min_free_gb} GB.")
+                self._clear_desired_recording(device_id)
                 if nas_connection_id and self._nas_manager is not None:
                     self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, False)
                 return
@@ -243,6 +272,7 @@ class CaptureSessionManager(QObject):
         # Cancel any NAS auto-recovery for this device.
         self._pending_nas_recordings.pop(device_id, None)
         self._paused_nas_recordings.pop(device_id, None)
+        self._desired_local_recordings.pop(device_id, None)
         desired_connection_id = self._desired_nas_recordings.pop(device_id, None)
         if desired_connection_id is not None:
             self._unregister_nas_watch(desired_connection_id)
@@ -333,10 +363,17 @@ class CaptureSessionManager(QObject):
         protected: Set[str] = set(self._active_files.values())
         self._storage_manager.updateActiveFolders(list(folders), protected)
 
-    # Start a worker for every newly detected camera.
+    # Start a worker for every newly detected camera and stop workers for removed cameras.
     def _on_video_inputs_changed(self) -> None:
-        for device in self._device_manager.video_inputs():
-            device_id = device.device_id
+        current_ids = {device.device_id for device in self._device_manager.video_inputs()}
+
+        # Stop workers for cameras that are no longer present.
+        for device_id in list(self._workers.keys()):
+            if device_id not in current_ids:
+                self._stop_session(device_id)
+
+        # Start workers for newly connected cameras.
+        for device_id in current_ids:
             if device_id not in self._workers:
                 self._start_session(device_id)
 
@@ -365,12 +402,14 @@ class CaptureSessionManager(QObject):
         worker.segmentFinalized.connect(self._on_segment_finalized, Qt.QueuedConnection)
 
         # Wire cleanup signals to thread
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(lambda: self._cleanup_thread(device_id))
+        thread.finished.connect(lambda: self._cleanup_thread(thread))
 
         # Wire worker signals back to manager with Qt.QueuedConnection so they execute on the GUI threa
-        worker.sessionReady.connect(self._on_session_ready, Qt.QueuedConnection)
+        worker.sessionStarted.connect(self._on_session_started, Qt.QueuedConnection)
         worker.errorOccurred.connect(self._on_worker_error, Qt.QueuedConnection)
+        worker.sessionRestartRequested.connect(
+            self._on_worker_restart_requested, Qt.QueuedConnection
+        )
         worker.fatalErrorOccurred.connect(
             lambda device_id, msg: self.fatalErrorOccurred.emit(f"[{device_id}] {msg}"),
             Qt.QueuedConnection,
@@ -385,7 +424,7 @@ class CaptureSessionManager(QObject):
         if device_id in self._sinks:
             self._setWorkerVideoSink.emit(device_id, self._sinks[device_id])
 
-    def _stop_session(self, device_id: str) -> None:
+    def _stop_session(self, device_id: str, blocking: bool = False) -> None:
         # Retrieve/ remove capture session from Worker/ Thread Dictionaries
         worker = self._workers.pop(device_id, None)
         thread = self._threads.pop(device_id, None)
@@ -399,51 +438,103 @@ class CaptureSessionManager(QObject):
         nas_connection_id = self._active_nas_recordings.pop(device_id, None)
         if nas_connection_id and self._nas_manager is not None:
             self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, False)
-        self._desired_nas_recordings.pop(device_id, None)
-        paused_connection_id = self._paused_nas_recordings.pop(device_id, None)
-        if paused_connection_id is not None:
-            self._unregister_nas_watch(paused_connection_id)
         self._update_storage_manager()
+
+        # Keep the worker alive until its thread has finished so cleanup can
+        # delete it safely.
+        self._pending_cleanup[thread] = worker
+
+        # Disconnect manager -> worker signals so stale connections do not
+        # interfere with a replacement worker.
+        for signal, slot in (
+            (self._setWorkerVideoSink, worker.setVideoSink),
+            (self._clearWorkerVideoSink, worker.clearVideoSink),
+            (self._startRecordingForWorker, worker.startRecording),
+            (self._stopRecordingForWorker, worker.stopRecording),
+        ):
+            try:
+                signal.disconnect(slot)
+            except Exception:
+                pass
 
         try:
             # Safetly Stop Worker Thread - Invoke Stop Method within Capture Session Worker
             QMetaObject.invokeMethod(worker, "stop", Qt.QueuedConnection)
             thread.quit()
 
-            # Give it 3 seconds for Thread to Finish
-            if not thread.wait(3000):
-                thread.terminate()
-                thread.wait()
+            if blocking:
+                # Give it 3 seconds for Thread to Finish
+                if not thread.wait(3000):
+                    thread.terminate()
+                    thread.wait()
         except Exception:
             pass
-        finally:
-            # Forceful Thread Termination
-            thread.deleteLater()
 
-    def _cleanup_thread(self, device_id: str) -> None:
-        self._workers.pop(device_id, None)
-        self._threads.pop(device_id, None)
-        self._recording_folders.pop(device_id, None)
-        self._active_files.pop(device_id, None)
-        self._pending_nas_recordings.pop(device_id, None)
-        nas_connection_id = self._active_nas_recordings.pop(device_id, None)
-        if nas_connection_id and self._nas_manager is not None:
-            self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, False)
-        self._desired_nas_recordings.pop(device_id, None)
-        paused_connection_id = self._paused_nas_recordings.pop(device_id, None)
-        if paused_connection_id is not None:
-            self._unregister_nas_watch(paused_connection_id)
-        self._update_storage_manager()
+    def _cleanup_thread(self, thread: QThread) -> None:
+        """Delete a finished worker whose thread has finished."""
+        worker = self._pending_cleanup.pop(thread, None)
+        if worker is not None:
+            worker.deleteLater()
+        thread.deleteLater()
 
     # Worker Signal Functions
-    def _on_session_ready(self, device_id: str, _session: QObject) -> None:
-        # The session object is owned by the worker thread; QML uses the video sink.
+    def _on_session_started(self, device_id: str) -> None:
         self._recording_states[device_id] = False
         self.sessionStarted.emit(device_id)
 
     def _on_worker_error(self, device_id: str, message: str) -> None:
-        # Workers stay alive until application shutdown
+        # Workers stay alive until application shutdown or session restart.
         self.errorOccurred.emit(message)
+
+    def _on_worker_restart_requested(self, device_id: str, reason: str) -> None:
+        """Queue a session restart for a camera that reported a recoverable error."""
+        if device_id in self._pending_restarts:
+            return
+        self.errorOccurred.emit(f"Restarting camera session for {device_id}: {reason}")
+        self._pending_restarts.add(device_id)
+        self._stop_session(device_id)
+
+    def _try_restart_session(self, device_id: str) -> None:
+        """Restart a session if the device is still present and we haven't looped."""
+        current_ids = {device.device_id for device in self._device_manager.video_inputs()}
+        if device_id not in current_ids:
+            return
+
+        now = time.time()
+        last_time = self._restart_attempt_times.get(device_id, 0)
+        if now - last_time > self._restart_window_seconds:
+            self._restart_attempts[device_id] = 0
+        self._restart_attempts[device_id] = self._restart_attempts.get(device_id, 0) + 1
+        self._restart_attempt_times[device_id] = now
+
+        if self._restart_attempts[device_id] > self._max_restarts_in_window:
+            self.errorOccurred.emit(
+                f"Camera {device_id} restarted too many times; manual intervention required"
+            )
+            return
+
+        self._start_session(device_id)
+        self._resume_desired_recording(device_id)
+
+    def _resume_desired_recording(self, device_id: str) -> None:
+        """Auto-resume recording to the previously selected destination, if any."""
+        local_path = self._desired_local_recordings.get(device_id)
+        if local_path is not None and device_id in self._workers:
+            self._begin_recording(device_id, local_path, nas_connection_id=None)
+            return
+
+        nas_connection_id = self._desired_nas_recordings.get(device_id)
+        if nas_connection_id is not None and device_id in self._workers:
+            if self._nas_manager is not None:
+                self._pending_nas_recordings[device_id] = nas_connection_id
+                self._nas_manager.mountForRecording(nas_connection_id, device_id)
+
+    def _clear_desired_recording(self, device_id: str) -> None:
+        """Clear the desired recording destination for a device."""
+        self._desired_local_recordings.pop(device_id, None)
+        nas_connection_id = self._desired_nas_recordings.pop(device_id, None)
+        if nas_connection_id is not None:
+            self._unregister_nas_watch(nas_connection_id)
 
     def _on_worker_recording_paused(self, device_id: str, message: str) -> None:
         """Handle a recoverable NAS outage reported by a worker."""
@@ -474,7 +565,12 @@ class CaptureSessionManager(QObject):
         nas_connection_id = self._active_nas_recordings.pop(device_id, None)
         if nas_connection_id and self._nas_manager is not None:
             self._nas_manager.setNasRecordingActive(device_id, nas_connection_id, False)
-        self._desired_nas_recordings.pop(device_id, None)
+
+        is_restart = device_id in self._pending_restarts
+        if not is_restart:
+            # Device was removed or shutdown; clear desired recordings.
+            self._desired_local_recordings.pop(device_id, None)
+            self._desired_nas_recordings.pop(device_id, None)
         paused_connection_id = self._paused_nas_recordings.pop(device_id, None)
         if paused_connection_id is not None:
             self._unregister_nas_watch(paused_connection_id)
@@ -483,10 +579,18 @@ class CaptureSessionManager(QObject):
             self.anyRecordingActiveChanged.emit()
         self.sessionStopped.emit(device_id)
 
+        # If this stop was part of a requested restart, attempt to restart.
+        if is_restart:
+            self._pending_restarts.discard(device_id)
+            self._try_restart_session(device_id)
+
     def _on_worker_recording_state_changed(self, device_id: str, is_recording: bool) -> None:
         old_any_active = self.anyRecordingActive
         self._recording_states[device_id] = is_recording
-        if not is_recording:
+        if is_recording:
+            # Successful recording means the session is healthy; reset restart counter.
+            self._restart_attempts[device_id] = 0
+        else:
             self._recording_folders.pop(device_id, None)
             self._active_files.pop(device_id, None)
             nas_connection_id = self._active_nas_recordings.pop(device_id, None)
@@ -508,6 +612,7 @@ class CaptureSessionManager(QObject):
     def _on_nas_recording_mount_failed(self, device_id: str, message: str) -> None:
         self._pending_nas_recordings.pop(device_id, None)
         self._active_nas_recordings.pop(device_id, None)
+        self._desired_nas_recordings.pop(device_id, None)
         self.errorOccurred.emit(message)
 
     def _on_segment_started(self, device_id: str, file_path: str) -> None:

@@ -20,6 +20,10 @@ def nas_manager(qtbot, ini_settings, monkeypatch, tmp_path):
         if thread.isRunning():
             thread.quit()
             thread.wait(2000)
+    for thread in list(mgr._operation_threads.values()):
+        if thread.isRunning():
+            thread.quit()
+            thread.wait(2000)
 
 
 def test_save_connection_adds_and_persists(nas_manager, qtbot):
@@ -154,7 +158,8 @@ def test_mount_for_recording_emits_path_when_mounted(nas_manager, qtbot, monkeyp
     monkeypatch.setattr("backend.nas_manager.mount_share", fake_mount)
 
     nas_manager.requestConnect(conn_id)
-    nas_manager.submitPassword(conn_id, "secret")
+    with qtbot.waitSignal(nas_manager.connectionStatusChanged):
+        nas_manager.submitPassword(conn_id, "secret")
 
     with qtbot.waitSignal(nas_manager.recordingPathReady) as blocker:
         nas_manager.mountForRecording(conn_id, "cam-1")
@@ -307,12 +312,13 @@ def test_recovery_mount_worker_emits_finished(qtbot, monkeypatch, tmp_path):
     monkeypatch.setattr("backend.nas_manager.mount_share", fake_mount)
     monkeypatch.setattr("backend.nas_manager.probe_nas_write", lambda _mp: (True, None))
 
-    worker = NasMountWorker(conn)
+    worker = NasMountWorker(conn, operation="")
     with qtbot.waitSignal(worker.finished, timeout=1000) as blocker:
         worker.perform_mount()
 
     assert blocker.args[0] == conn.id
-    assert blocker.args[1] is True
+    assert blocker.args[1] == ""
+    assert blocker.args[2] is True
 
 
 def test_recovery_mount_worker_emits_failed_on_bad_mount(qtbot, monkeypatch, tmp_path):
@@ -327,13 +333,14 @@ def test_recovery_mount_worker_emits_failed_on_bad_mount(qtbot, monkeypatch, tmp
         lambda *args, **kwargs: (False, None, "host unreachable"),
     )
 
-    worker = NasMountWorker(conn)
+    worker = NasMountWorker(conn, operation="")
     with qtbot.waitSignal(worker.finished, timeout=1000) as blocker:
         worker.perform_mount()
 
     assert blocker.args[0] == conn.id
-    assert blocker.args[1] is False
-    assert "host unreachable" in blocker.args[2]
+    assert blocker.args[1] == ""
+    assert blocker.args[2] is False
+    assert "host unreachable" in blocker.args[3]
 
 
 def test_on_mount_finished_restores_connection(nas_manager, qtbot, monkeypatch, tmp_path):
@@ -350,7 +357,7 @@ def test_on_mount_finished_restores_connection(nas_manager, qtbot, monkeypatch, 
 
     with qtbot.waitSignal(nas_manager.connectionRestored, timeout=1000) as blocker:
         nas_manager._recovery_watcher._on_mount_finished(
-            conn_id, True, "", str(mount_point), ""
+            conn_id, "", True, "", str(mount_point), ""
         )
 
     assert blocker.args[0] == conn_id
@@ -393,6 +400,9 @@ def test_ensure_recording_path_returns_folder_when_mounted(nas_manager, qtbot, m
     monkeypatch.setattr("backend.nas_manager.mount_share", fake_mount)
 
     nas_manager.requestConnect(conn_id)
+    with qtbot.waitSignal(nas_manager.connectionStatusChanged):
+        pass
+
     path = nas_manager.ensureRecordingPath(conn_id, "cam-1")
     assert path is not None
     assert "cam-1" in path

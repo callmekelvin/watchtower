@@ -3,7 +3,7 @@ import re
 from datetime import datetime, timezone
 from typing import Optional
 
-from PySide6.QtCore import QObject, Signal, Slot, QUrl, QTimer, QDateTime
+from PySide6.QtCore import QObject, Signal, Slot, QUrl, QTimer, QDateTime, QCoreApplication
 from PySide6.QtMultimedia import QCamera, QCameraDevice, QMediaCaptureSession, QMediaDevices, QMediaFormat, QMediaMetaData, QMediaRecorder, QVideoSink
 
 from backend.device_worker import _decode_id
@@ -20,16 +20,19 @@ def _sanitize_filename(name: str) -> str:
 # Dedicated QThreadWorker that runs QMediaCaptureSession
 # The session, camera, recorder, and a private QMediaDevices instance all live on this worker thread so that the GUI thread is never blocked.
 class CaptureSessionWorker(QObject):
-    # Emitted once the QMediaCaptureSession has been created (Arg: device_id, session)
-    # Receivers must not call methods on the session object from another thread
-    sessionReady = Signal(str, QObject)
+    # Emitted once the QMediaCaptureSession has been created (Arg: device_id)
+    sessionStarted = Signal(str)
 
-    # Signal emitted when the worker encounters an error (Arg: device_id, message)
+    # Emitted when the worker encounters an error (Arg: device_id, message)
     errorOccurred = Signal(str, str)
 
-    # Signal emitted when a recording failure should terminate the application.
+    # Emitted when a recording failure should terminate the application.
     # Args: device_id, message
     fatalErrorOccurred = Signal(str, str)
+
+    # Emitted when the camera session has encountered a recoverable error and
+    # should be restarted by the manager. Args: device_id, reason
+    sessionRestartRequested = Signal(str, str)
 
     # Signal emitted when a NAS destination becomes unreachable and recording
     # is paused pending auto-recovery. Args: device_id, message
@@ -116,10 +119,8 @@ class CaptureSessionWorker(QObject):
             if self._video_sink is not None:
                 self._session.setVideoSink(self._video_sink)
 
-            # Notify the manager that the session object exists. The manager only
-            # uses this to track that the worker has started; QML binds to the
-            # video sink, not the session object.
-            self.sessionReady.emit(self._device_id, self._session)
+            # Notify the manager that the session object exists.
+            self.sessionStarted.emit(self._device_id)
 
             # Find and store the corect QCameraDevice by Device ID
             self._camera_device = None
@@ -140,17 +141,19 @@ class CaptureSessionWorker(QObject):
 
             # Create QCamera Object using QCameraDevice
             self._camera = QCamera(self._camera_device, self)
-            self._camera.errorOccurred.connect(
-                lambda _error, msg: self.errorOccurred.emit(
-                    self._device_id, f"Camera error: {msg}"
-                )
-            )
+            self._camera.errorOccurred.connect(self._on_camera_error)
 
             # Set QMediaCaptureSession to QCamera and Start Camera
             self._session.setCamera(self._camera)
             self._camera.start()
         except Exception as exc:
             self.errorOccurred.emit(self._device_id, str(exc))
+
+    def _on_camera_error(self, error, error_string: str) -> None:
+        """Handle a camera error by reporting it and requesting a session restart."""
+        message = f"Camera error: {error_string or str(error)}"
+        self.errorOccurred.emit(self._device_id, message)
+        self.sessionRestartRequested.emit(self._device_id, message)
 
     # Configure the recorder to use the camera's maximum resolution and frame rate.
     def _configure_recorder(self, camera_device: QCameraDevice) -> None:
@@ -218,7 +221,7 @@ class CaptureSessionWorker(QObject):
                 self._nas_health_timer.start(5000)
         else:
             self._nas_health_timer.stop()
-        self.recordingStateChanged.emit(self._device_id, self._is_recording)
+        self.recordingStateChanged.emit(self._device_id, is_recording)
 
     def _on_nas_health_check(self) -> None:
         if not self._is_recording or not self._output_folder:
@@ -446,5 +449,9 @@ class CaptureSessionWorker(QObject):
             # Notify Capture Session Manager Thread of termination error
             self.errorOccurred.emit(self._device_id, str(exc))
         finally:
+            # Move back to the main thread so the manager can delete us safely.
+            app_thread = QCoreApplication.instance().thread()
+            if self.thread() is not app_thread:
+                self.moveToThread(app_thread)
             # Notify Capture Session Manager Thread has stopped
             self.stopped.emit(self._device_id)

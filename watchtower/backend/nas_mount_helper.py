@@ -90,6 +90,13 @@ def ensure_mount_point_dir(mount_point: Path) -> None:
 # hanging the recorder thread when the network drops.
 _DEFAULT_NFS_OPTIONS = ["soft", "timeo=50", "retrans=3"]
 
+# Privileged helper scripts used on Linux instead of calling mount/umount
+# directly.  These are installed by scripts/install-mount-helper.sh and are
+# validated by a narrow sudoers rule, so the user is never prompted for a
+# password at runtime.
+_LINUX_MOUNT_HELPER = "watchtower-mount"
+_LINUX_UNMOUNT_HELPER = "watchtower-umount"
+
 
 def _build_nfs_options(connection: NasConnection) -> str:
     """Build an NFS options string with resilience defaults appended.
@@ -191,13 +198,13 @@ def _build_linux_mount(
 
     if connection.protocol == NasProtocol.SMB:
         source = f"//{host}/{share}"
+        # The mount point must be the last positional argument so the helper
+        # script can validate it.
         cmd: List[str] = [
             "sudo",
-            "mount",
+            _LINUX_MOUNT_HELPER,
             "-t",
             "cifs",
-            source,
-            str(mount_point),
         ]
         options: List[str] = ["rw"]
         if connection.username:
@@ -207,6 +214,7 @@ def _build_linux_mount(
         if connection.mount_options:
             options.extend(connection.mount_options.split(","))
         cmd.extend(["-o", ",".join(options)])
+        cmd.extend([source, str(mount_point)])
 
         extras: Dict[str, str] = {}
         if password:
@@ -218,7 +226,16 @@ def _build_linux_mount(
     if connection.protocol == NasProtocol.NFS:
         source = f"{host}:/{share}"
         options = _build_nfs_options(connection)
-        cmd = ["sudo", "mount", "-t", "nfs", source, str(mount_point), "-o", options]
+        cmd = [
+            "sudo",
+            _LINUX_MOUNT_HELPER,
+            "-t",
+            "nfs",
+            "-o",
+            options,
+            source,
+            str(mount_point),
+        ]
         return cmd, {}
 
     raise ValueError(f"Unsupported protocol: {connection.protocol}")
@@ -330,7 +347,7 @@ def build_unmount_command(
 
     if system == "Darwin":
         return ["sudo", "umount", *flags, str(mount_point)], None
-    return ["sudo", "umount", *flags, str(mount_point)], None
+    return ["sudo", _LINUX_UNMOUNT_HELPER, *flags, str(mount_point)], None
 
 
 def build_junction_command(

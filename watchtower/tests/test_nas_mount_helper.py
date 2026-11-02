@@ -78,15 +78,15 @@ def test_build_linux_smb_mount_command(monkeypatch, tmp_path):
     cmd, extras = build_mount_command(conn, mount_point, password="secret")
 
     assert cmd[0] == "sudo"
-    assert cmd[1] == "mount"
+    assert cmd[1] == "watchtower-mount"
     assert cmd[2] == "-t"
     assert cmd[3] == "cifs"
-    assert cmd[4] == "//nas/recordings"
-    assert cmd[5] == str(mount_point)
     assert "-o" in cmd
     opts = cmd[cmd.index("-o") + 1]
     assert "rw" in opts
     assert "username=user" in opts
+    assert cmd[-2] == "//nas/recordings"
+    assert cmd[-1] == str(mount_point)
     assert extras["env"]["PASSWD"] == "secret"
 
 
@@ -99,11 +99,11 @@ def test_build_linux_nfs_mount_command(monkeypatch, tmp_path):
     cmd, extras = build_mount_command(conn, mount_point)
 
     assert cmd[0] == "sudo"
-    assert cmd[1] == "mount"
+    assert cmd[1] == "watchtower-mount"
     assert cmd[2] == "-t"
     assert cmd[3] == "nfs"
-    assert cmd[4] == "nas:/export"
-    assert cmd[5] == str(mount_point)
+    assert cmd[-2] == "nas:/export"
+    assert cmd[-1] == str(mount_point)
     opts = cmd[cmd.index("-o") + 1]
     assert "rw" in opts
     assert "soft" in opts
@@ -187,14 +187,14 @@ def test_build_macos_nfs_mount_command(monkeypatch, tmp_path):
 def test_build_unmount_command_linux(monkeypatch, tmp_path):
     monkeypatch.setattr("backend.nas_mount_helper.platform.system", lambda: "Linux")
     cmd, drive = build_unmount_command(tmp_path / "mount")
-    assert cmd == ["sudo", "umount", str(tmp_path / "mount")]
+    assert cmd == ["sudo", "watchtower-umount", str(tmp_path / "mount")]
     assert drive is None
 
 
 def test_build_unmount_command_linux_lazy(monkeypatch, tmp_path):
     monkeypatch.setattr("backend.nas_mount_helper.platform.system", lambda: "Linux")
     cmd, drive = build_unmount_command(tmp_path / "mount", lazy=True)
-    assert "-l" in cmd
+    assert cmd == ["sudo", "watchtower-umount", "-l", str(tmp_path / "mount")]
     assert drive is None
 
 
